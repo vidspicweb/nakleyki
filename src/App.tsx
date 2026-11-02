@@ -5,6 +5,7 @@ import { TemplatesPage } from './pages/TemplatesPage'
 import { EditorPage } from './pages/EditorPage'
 import { PrintPage } from './pages/PrintPage'
 import { SettingsMenu } from './components/SettingsMenu'
+import { CloudButton } from './components/CloudButton'
 
 export type Tab = 'students' | 'templates' | 'editor' | 'print'
 
@@ -49,7 +50,10 @@ function Shell() {
             </button>
           ))}
         </nav>
-        <SettingsMenu />
+        <div className="top-actions">
+          <CloudButton />
+          <SettingsMenu />
+        </div>
       </header>
       <main className="content">
         {tab === 'students' && <StudentsPage goNext={() => setTab('templates')} />}

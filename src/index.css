@@ -1785,3 +1785,114 @@ input[type='range'] {
   flex-direction: column;
   gap: 8px;
 }
+
+/* ---------- Яндекс Диск ---------- */
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cloud {
+  position: relative;
+}
+.cloud-btn {
+  border: 1.5px solid var(--line);
+  background: #fff;
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-weight: 700;
+  font-size: 14px;
+  cursor: pointer;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.cloud-btn:hover {
+  border-color: var(--primary);
+}
+.cloud-btn.ok {
+  background: var(--green-soft);
+  border-color: transparent;
+  color: #0b6e40;
+}
+.cloud-btn.busy {
+  background: var(--primary-soft);
+  border-color: transparent;
+  color: var(--primary-dark);
+}
+.cloud-btn.err {
+  background: var(--yellow-soft);
+  border-color: transparent;
+  color: #8a5a00;
+}
+.mini-spin {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid rgba(46, 108, 255, 0.25);
+  border-top-color: var(--primary);
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+}
+.cloud-pop {
+  width: 320px;
+  z-index: 40;
+}
+.cloud-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}
+.ya-logo {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: #fc3f1d;
+  color: #fff;
+  font-weight: 900;
+  display: grid;
+  place-items: center;
+  font-size: 18px;
+  flex: none;
+}
+.cloud-list {
+  margin: 4px 0;
+  padding-left: 18px;
+  font-size: 13.5px;
+  color: #3d4366;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.cloud-status {
+  font-size: 14px;
+  font-weight: 700;
+  border-radius: 10px;
+  padding: 8px 10px;
+  background: #f3f5fa;
+}
+.cloud-status.ok {
+  background: var(--green-soft);
+  color: #0b6e40;
+}
+.cloud-status.error {
+  background: var(--yellow-soft);
+  color: #8a5a00;
+}
+.disk-space .bar {
+  height: 8px;
+  border-radius: 999px;
+  background: #eef1f8;
+  overflow: hidden;
+  margin-bottom: 4px;
+}
+.disk-space .bar div {
+  height: 100%;
+  background: var(--primary);
+}
+@media (max-width: 820px) {
+  .cloud-pop {
+    right: -50px;
+  }
+}

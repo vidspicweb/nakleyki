@@ -5,6 +5,7 @@ import { deletePdf, deleteThumb, storageInfo } from '../storage'
 import { importFile, isImage, isPdf } from '../importer'
 import type { Sheet } from '../types'
 import { plural } from '../util'
+import { markDeleted } from '../cloud/merge'
 import { Thumb } from '../components/Thumb'
 import { FilterBar, TagPopover } from '../components/Tags'
 import { applyTag, filterSheets, tagLabel } from '../tags'
@@ -79,11 +80,13 @@ export function TemplatesPage({ goNext }: { goNext: () => void }) {
     update((d) => {
       const removed = d.sheets.filter((x) => ids.includes(x.id))
       d.sheets = d.sheets.filter((x) => !ids.includes(x.id))
+      markDeleted(d, ids)
       for (const s of removed) deleteThumb(s.id)
       // файлы, от которых не осталось ни одного листа, удаляем совсем
       for (const tid of new Set(removed.map((s) => s.templateId))) {
         if (!d.sheets.some((x) => x.templateId === tid)) {
           d.templates = d.templates.filter((t) => t.id !== tid)
+          markDeleted(d, [tid])
           deletePdf(tid)
           forgetPdf(tid)
         }

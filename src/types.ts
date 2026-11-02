@@ -89,6 +89,8 @@ export interface AppState {
   activeSheetId?: string
   lastLayout?: Layout
   customTags?: string[] // метки, которые пользователь придумал сам
+  updatedAt?: number // когда данные менялись в последний раз (для синхронизации)
+  deleted?: Record<string, number> // что удалено: id → когда (чтобы удаление дошло до других компьютеров)
   print: { classIds: string[]; sheetIds: string[]; copies: number }
 }
 

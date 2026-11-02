@@ -3,6 +3,7 @@ import { useApp } from '../store'
 import { detectGender, genitive, parseStudents } from '../names'
 import type { SchoolClass, Student } from '../types'
 import { plural, uid } from '../util'
+import { markDeleted } from '../cloud/merge'
 
 export function StudentsPage({ goNext }: { goNext: () => void }) {
   const { state, update, toast } = useApp()
@@ -69,6 +70,7 @@ export function StudentsPage({ goNext }: { goNext: () => void }) {
               if (!confirm(`Удалить класс ${active.grade} ${active.letter} со всеми учениками?`)) return
               update((d) => {
                 d.classes = d.classes.filter((c) => c.id !== active.id)
+                markDeleted(d, [active.id])
                 d.activeClassId = d.classes[0]?.id
               })
               toast('Класс удалён')

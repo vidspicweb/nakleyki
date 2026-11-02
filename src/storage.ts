@@ -25,16 +25,51 @@ export async function loadState(): Promise<AppState> {
 
 export const saveState = (s: AppState) => set('state', s, store)
 
+export type FileKind = 'pdf' | 'font' | 'thumb'
+
+/**
+ * Если файла нет в этом браузере, его можно попросить из облака (Яндекс Диск).
+ * Модуль синхронизации подставляет сюда свою функцию после входа.
+ */
+let remote: ((kind: FileKind, id: string) => Promise<Blob | null>) | null = null
+export const setRemoteFetcher = (fn: typeof remote) => (remote = fn)
+
+const pending = new Map<string, Promise<unknown>>()
+async function getWithRemote<T>(kind: FileKind, id: string, asBlob: boolean): Promise<T | undefined> {
+  const local = await get<T>(kind + ':' + id, store)
+  if (local || !remote) return local
+  const key = kind + ':' + id
+  let p = pending.get(key) as Promise<T | undefined> | undefined
+  if (!p) {
+    p = (async () => {
+      const blob = await remote!(kind, id).catch((e) => {
+        console.warn('Не удалось взять файл из облака', key, e)
+        return null
+      })
+      if (!blob) return undefined
+      const val = (asBlob ? blob : await blob.arrayBuffer()) as T
+      await set(key, val, store)
+      return val
+    })()
+    pending.set(key, p)
+    p.finally(() => pending.delete(key))
+  }
+  return p
+}
+
 export const savePdf = (id: string, bytes: ArrayBuffer) => set('pdf:' + id, bytes, store)
-export const loadPdf = (id: string) => get<ArrayBuffer>('pdf:' + id, store)
+export const loadPdf = (id: string) => getWithRemote<ArrayBuffer>('pdf', id, false)
+export const loadPdfLocal = (id: string) => get<ArrayBuffer>('pdf:' + id, store)
 export const deletePdf = (id: string) => del('pdf:' + id, store)
 
 export const saveFontFile = (id: string, bytes: ArrayBuffer) => set('font:' + id, bytes, store)
-export const loadFontFile = (id: string) => get<ArrayBuffer>('font:' + id, store)
+export const loadFontFile = (id: string) => getWithRemote<ArrayBuffer>('font', id, false)
+export const loadFontLocal = (id: string) => get<ArrayBuffer>('font:' + id, store)
 export const deleteFontFile = (id: string) => del('font:' + id, store)
 
 export const saveThumb = (sheetId: string, blob: Blob) => set('thumb:' + sheetId, blob, store)
-export const loadThumb = (sheetId: string) => get<Blob>('thumb:' + sheetId, store)
+export const loadThumb = (sheetId: string) => getWithRemote<Blob>('thumb', sheetId, true)
+export const loadThumbLocal = (sheetId: string) => get<Blob>('thumb:' + sheetId, store)
 export const deleteThumb = (sheetId: string) => del('thumb:' + sheetId, store)
 
 /** Просим браузер не удалять библиотеку при нехватке места. */
