@@ -2514,3 +2514,76 @@ input[type='range'] {
   border-color: var(--primary);
   background: var(--primary-soft);
 }
+
+/* ---------- вырезать фрагменты ---------- */
+.frag-dim {
+  position: absolute;
+  inset: 0;
+  background: rgba(27, 31, 59, 0.45);
+  pointer-events: none;
+  border-radius: 8px;
+}
+.frag-box {
+  position: absolute;
+  outline: 2.5px solid var(--primary);
+  cursor: move;
+  box-shadow: 0 0 0 1px #fff inset;
+}
+.frag-box.on {
+  outline-color: var(--coral);
+}
+.frag-box.drawing {
+  outline: 2px dashed var(--primary);
+  background: rgba(46, 108, 255, 0.12);
+  pointer-events: none;
+}
+.frag-num {
+  position: absolute;
+  left: -2px;
+  top: -26px;
+  background: var(--primary);
+  color: #fff;
+  font-weight: 900;
+  font-size: 13px;
+  border-radius: 8px 8px 0 0;
+  padding: 2px 9px;
+  pointer-events: none;
+}
+.frag-box.on .frag-num {
+  background: var(--coral);
+}
+.frag-h {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  border: 2.5px solid var(--primary);
+}
+.frag-box.on .frag-h {
+  border-color: var(--coral);
+}
+.frag-h.nw {
+  left: -8px;
+  top: -8px;
+  cursor: nwse-resize;
+}
+.frag-h.se {
+  right: -8px;
+  bottom: -8px;
+  cursor: nwse-resize;
+}
+.frag-h.ne {
+  right: -8px;
+  top: -8px;
+  cursor: nesw-resize;
+}
+.frag-h.sw {
+  left: -8px;
+  bottom: -8px;
+  cursor: nesw-resize;
+}
+.frag-box .edit-del {
+  top: -12px;
+  right: 14px;
+}

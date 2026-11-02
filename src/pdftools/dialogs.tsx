@@ -407,3 +407,214 @@ export function EditDialog({ page, close, save }: { page: PageRef; close: () => 
     document.body,
   )
 }
+
+/* ============================== ВЫРЕЗАТЬ ФРАГМЕНТЫ ============================== */
+
+type Corner = 'nw' | 'ne' | 'sw' | 'se'
+type FDrag =
+  | { mode: 'new'; sx: number; sy: number }
+  | { mode: 'move'; i: number; sx: number; sy: number; start: FRect }
+  | { mode: 'resize'; i: number; corner: Corner; start: FRect }
+
+/**
+ * Рисуем рамки вокруг нужных фрагментов — каждая рамка станет отдельным листом.
+ * Рамки в долях от листа, как он виден на экране.
+ */
+export function FragmentsDialog({
+  page,
+  close,
+  apply,
+  openLines,
+}: {
+  page: PageRef
+  close: () => void
+  apply: (boxes: FRect[], keepOriginal: boolean) => void
+  openLines: () => void
+}) {
+  const size = fitSize(page, Math.min(820, window.innerWidth - 400), window.innerHeight - 190)
+  const { ref, full } = useDisplayCanvas(page, size.w)
+  const [boxes, setBoxes] = useState<FRect[]>([])
+  const [active, setActive] = useState<number | null>(null)
+  const [drawing, setDrawing] = useState<FRect | null>(null)
+  const [keep, setKeep] = useState(true)
+  const [trim, setTrim] = useState(true)
+  const drag = useRef<FDrag | null>(null)
+  const box = useRef<HTMLDivElement>(null)
+
+  const pos = (e: React.PointerEvent) => {
+    const r = box.current!.getBoundingClientRect()
+    return { x: clamp01((e.clientX - r.left) / r.width), y: clamp01((e.clientY - r.top) / r.height) }
+  }
+
+  const down = (e: React.PointerEvent) => {
+    const p = pos(e)
+    drag.current = { mode: 'new', sx: p.x, sy: p.y }
+    setDrawing({ x: p.x, y: p.y, w: 0, h: 0 })
+    setActive(null)
+    box.current?.setPointerCapture(e.pointerId)
+  }
+  const startBoxDrag = (e: React.PointerEvent, i: number, corner?: Corner) => {
+    e.stopPropagation()
+    e.preventDefault()
+    const p = pos(e)
+    drag.current = corner ? { mode: 'resize', i, corner, start: boxes[i] } : { mode: 'move', i, sx: p.x, sy: p.y, start: boxes[i] }
+    setActive(i)
+    box.current?.setPointerCapture(e.pointerId)
+  }
+  const move = (e: React.PointerEvent) => {
+    const d = drag.current
+    if (!d) return
+    const p = pos(e)
+    if (d.mode === 'new') setDrawing({ x: Math.min(d.sx, p.x), y: Math.min(d.sy, p.y), w: Math.abs(p.x - d.sx), h: Math.abs(p.y - d.sy) })
+    else if (d.mode === 'move') {
+      const r = d.start
+      const nb = { ...r, x: Math.min(1 - r.w, Math.max(0, r.x + p.x - d.sx)), y: Math.min(1 - r.h, Math.max(0, r.y + p.y - d.sy)) }
+      setBoxes((all) => all.map((b, j) => (j === d.i ? nb : b)))
+    } else {
+      const r = d.start
+      let x1 = r.x
+      let y1 = r.y
+      let x2 = r.x + r.w
+      let y2 = r.y + r.h
+      if (d.corner.includes('w')) x1 = Math.min(p.x, x2 - 0.02)
+      if (d.corner.includes('e')) x2 = Math.max(p.x, x1 + 0.02)
+      if (d.corner.includes('n')) y1 = Math.min(p.y, y2 - 0.02)
+      if (d.corner.includes('s')) y2 = Math.max(p.y, y1 + 0.02)
+      setBoxes((all) => all.map((b, j) => (j === d.i ? { x: x1, y: y1, w: x2 - x1, h: y2 - y1 } : b)))
+    }
+  }
+  const up = () => {
+    const d = drag.current
+    drag.current = null
+    if (d?.mode === 'new' && drawing) {
+      if (drawing.w > 0.015 && drawing.h > 0.015) {
+        setBoxes((b) => [...b, drawing])
+        setActive(boxes.length)
+      }
+      setDrawing(null)
+    }
+  }
+  const remove = (i: number) => {
+    setBoxes((b) => b.filter((_, j) => j !== i))
+    setActive(null)
+  }
+
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') close()
+      if ((e.key === 'Delete' || e.key === 'Backspace') && active !== null) remove(active)
+    }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  })
+
+  /** Подрезаем белые поля внутри рамки, чтобы фрагмент был ровно по содержимому. */
+  const trimBoxes = (list: FRect[]): FRect[] => {
+    if (!trim || !full) return list
+    const c = composeDisplay(full, page, 900)
+    const W = c.width
+    const H = c.height
+    const data = c.getContext('2d')!.getImageData(0, 0, W, H).data
+    return list.map((b) => {
+      const x0 = Math.floor(b.x * W)
+      const y0 = Math.floor(b.y * H)
+      const x1 = Math.ceil((b.x + b.w) * W)
+      const y1 = Math.ceil((b.y + b.h) * H)
+      let minX = x1
+      let minY = y1
+      let maxX = x0
+      let maxY = y0
+      for (let y = y0; y < y1; y++)
+        for (let x = x0; x < x1; x++) {
+          const i = (y * W + x) * 4
+          if (data[i] < 242 || data[i + 1] < 242 || data[i + 2] < 242) {
+            if (x < minX) minX = x
+            if (x > maxX) maxX = x
+            if (y < minY) minY = y
+            if (y > maxY) maxY = y
+          }
+        }
+      if (maxX <= minX || maxY <= minY) return b
+      const pad = 2
+      const nx = Math.max(x0, minX - pad) / W
+      const ny = Math.max(y0, minY - pad) / H
+      return { x: nx, y: ny, w: Math.min(x1, maxX + pad + 1) / W - nx, h: Math.min(y1, maxY + pad + 1) / H - ny }
+    })
+  }
+
+  const pct = (r: FRect) => ({ left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.w * 100}%`, height: `${r.h * 100}%` })
+
+  return createPortal(
+    <div className="modal-back" onClick={close}>
+      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+        <h2>⬚ Вырезать фрагменты</h2>
+        <div className="cut-layout">
+          <div className="edit-stage frag-stage" ref={box} style={{ width: size.w, height: size.h }} onPointerDown={down} onPointerMove={move} onPointerUp={up}>
+            <canvas ref={ref} style={{ width: size.w, height: size.h }} />
+            {boxes.length > 0 && <div className="frag-dim" style={{ clipPath: dimPath(boxes) }} />}
+            {boxes.map((b, i) => (
+              <div key={i} className={'frag-box' + (active === i ? ' on' : '')} style={pct(b)} onPointerDown={(e) => startBoxDrag(e, i)}>
+                <span className="frag-num">{i + 1}</span>
+                {(['nw', 'ne', 'sw', 'se'] as Corner[]).map((c) => (
+                  <span key={c} className={'frag-h ' + c} onPointerDown={(e) => startBoxDrag(e, i, c)} />
+                ))}
+                <button className="edit-del" onPointerDown={(e) => e.stopPropagation()} onClick={() => remove(i)} title="Убрать рамку">
+                  ✕
+                </button>
+              </div>
+            ))}
+            {drawing && drawing.w > 0 && <div className="frag-box drawing" style={pct(drawing)} />}
+          </div>
+          <div className="cut-side">
+            <div className="hint">
+              <b>Нарисуйте мышкой рамку</b> вокруг нужного фрагмента. Можно нарисовать сколько угодно рамок — каждая станет отдельным листом.
+            </div>
+            <ul className="muted tiny tips">
+              <li>Рамку можно перетаскивать, а за уголки — менять размер.</li>
+              <li>✕ на рамке или клавиша Delete — убрать рамку.</li>
+            </ul>
+            <label className="radio-row">
+              <input type="checkbox" checked={trim} onChange={(e) => setTrim(e.target.checked)} /> Убрать лишние белые поля вокруг фрагмента
+            </label>
+            <div className="divider" />
+            <div className="muted tiny">Что сделать с исходным листом:</div>
+            <label className="radio-row">
+              <input type="radio" checked={keep} onChange={() => setKeep(true)} /> Оставить, фрагменты поставить после него
+            </label>
+            <label className="radio-row">
+              <input type="radio" checked={!keep} onChange={() => setKeep(false)} /> Заменить фрагментами
+            </label>
+            <div className="cut-result">
+              {boxes.length ? (
+                <>
+                  Получится <b>{boxes.length}</b> {plural(boxes.length, 'новый лист', 'новых листа', 'новых листов')}
+                </>
+              ) : (
+                'Пока нет ни одной рамки'
+              )}
+            </div>
+            <button className="link-btn" onClick={openLines}>
+              Нужно разрезать весь лист ровно на части? Разрезать линиями →
+            </button>
+            <div className="row end gap-s" style={{ marginTop: 'auto' }}>
+              <button className="btn ghost" onClick={close}>
+                Отмена
+              </button>
+              <button className="btn primary" disabled={!boxes.length} onClick={() => apply(trimBoxes(boxes), keep)}>
+                ⬚ Вырезать
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+/** Затемняем всё, кроме рамок (обводка-«дырки» через clip-path с правилом evenodd). */
+function dimPath(boxes: FRect[]) {
+  const p = (x: number, y: number) => `${(x * 100).toFixed(3)}% ${(y * 100).toFixed(3)}%`
+  const rects = boxes.map((b) => `${p(b.x, b.y)}, ${p(b.x + b.w, b.y)}, ${p(b.x + b.w, b.y + b.h)}, ${p(b.x, b.y + b.h)}, ${p(b.x, b.y)}`)
+  return `polygon(evenodd, 0% 0%, 100% 0%, 100% 100%, 0% 100%, 0% 0%, ${rects.join(', 0% 0%, ')}, 0% 0%)`
+}

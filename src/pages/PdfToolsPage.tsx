@@ -5,7 +5,7 @@ import { importFile } from '../importer'
 import { plural } from '../util'
 import { blankPage, buildPdf, composeDisplay, download, dropSource, fullRender, loadFile, parseRanges, saveGroups } from '../pdftools/engine'
 import type { Edit, PageRef, Source } from '../pdftools/engine'
-import { CutDialog, EditDialog } from '../pdftools/dialogs'
+import { CutDialog, EditDialog, FragmentsDialog } from '../pdftools/dialogs'
 import type { CutScope } from '../pdftools/dialogs'
 import { FULL, compose, rebase, toBase } from '../pdftools/geom'
 import type { FRect } from '../pdftools/geom'
@@ -28,6 +28,7 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
   const [split, setSplit] = useState(false)
   const [preview, setPreview] = useState<PageRef | null>(null)
   const [cutting, setCutting] = useState<PageRef | null>(null)
+  const [fragmenting, setFragmenting] = useState<PageRef | null>(null)
   const [editing, setEditing] = useState<PageRef | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
@@ -95,6 +96,22 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
     setPages((cur) => (lastSel >= 0 ? [...cur.slice(0, lastSel + 1), b, ...cur.slice(lastSel + 1)] : [...cur, b]))
   }
 
+  /** Кусок листа (прямоугольник — как видно на экране) → новый лист. */
+  const pieceOf = (p: PageRef, cell: FRect): PageRef => {
+    const piece = toBase(cell, p.rot) // часть в координатах листа без поворота
+    const crop = compose(p.crop ?? FULL, piece)
+    const edits = p.edits?.map((e): Edit => (e.kind === 'copy' ? { kind: 'copy', from: rebase(e.from, piece), to: rebase(e.to, piece) } : { kind: 'erase', rect: rebase(e.rect, piece) }))
+    return { ...p, key: uid(), crop, edits, w: crop.w * p.fw, h: crop.h * p.fh }
+  }
+
+  const cutFragments = (boxes: FRect[], keep: boolean, around: PageRef) => {
+    const pieces = boxes.map((b) => pieceOf(around, b))
+    setPages((cur) => cur.flatMap((p) => (p.key === around.key ? (keep ? [p, ...pieces] : pieces) : [p])))
+    setSelected(pieces.map((p) => p.key))
+    setFragmenting(null)
+    toast(`Вырезано ${pieces.length} ${plural(pieces.length, 'фрагмент', 'фрагмента', 'фрагментов')} — они выделены синим. Отменить — «↶ Отменить»`)
+  }
+
   /** Разрезаем листы: каждый превращается в несколько (части — как видно на экране). */
   const cutPages = (cells: FRect[], scope: CutScope, around: PageRef) => {
     const targets = new Set(scope === 'one' ? [around.key] : scope === 'selected' ? selected : pages.map((p) => p.key))
@@ -103,11 +120,8 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
       cur.flatMap((p) => {
         if (!targets.has(p.key) || !p.src) return [p]
         return cells.map((cell) => {
-          const piece = toBase(cell, p.rot) // часть в координатах листа без поворота
-          const crop = compose(p.crop ?? FULL, piece)
-          const edits = p.edits?.map((e): Edit => (e.kind === 'copy' ? { kind: 'copy', from: rebase(e.from, piece), to: rebase(e.to, piece) } : { kind: 'erase', rect: rebase(e.rect, piece) }))
           made++
-          return { ...p, key: uid(), crop, edits, w: crop.w * p.fw, h: crop.h * p.fh }
+          return pieceOf(p, cell)
         })
       }),
     )
@@ -184,7 +198,7 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement
-      if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || split || preview || cutting || editing) return
+      if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || split || preview || cutting || editing || fragmenting) return
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') (e.preventDefault(), undo())
       else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'a' || e.key.toLowerCase() === 'ф') && pages.length) (e.preventDefault(), setSelected(pages.map((p) => p.key)))
       else if ((e.key === 'Delete' || e.key === 'Backspace') && selected.length) (e.preventDefault(), remove(selected))
@@ -249,6 +263,7 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
             ['↕️', 'Поменять порядок', 'Перетаскивайте листы мышкой'],
             ['➕', 'Добавить листы', 'Из другого PDF, картинки или пустой лист'],
             ['🔗', 'Объединить файлы', 'Откройте несколько PDF сразу'],
+            ['⬚', 'Вырезать фрагменты', 'Обведите рамкой нужную часть листа — она станет отдельным листом'],
             ['✂️', 'Разделить PDF', 'По одному листу, по диапазонам или по N листов'],
             ['⟳', 'Повернуть', 'Если лист отсканирован боком'],
           ].map(([icon, t, d]) => (
@@ -311,7 +326,7 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
         <div className="row gap-s wrap sel-actions">
           {n === 0 ? (
             <>
-              <span className="muted tiny">Нажмите на лист, чтобы выбрать. Shift — выбрать подряд.</span>
+              <span className="muted tiny">Нажмите на лист, чтобы выбрать. Наведите на лист: ✂ — вырезать фрагменты, ✏️ — править.</span>
               <button className="link-btn" onClick={() => setSelected(pages.map((p) => p.key))}>
                 Выбрать все
               </button>
@@ -329,8 +344,13 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
                 ⧉ Дублировать
               </button>
               <button className="btn ghost small" onClick={() => setCutting(selPages.find((p) => p.src) ?? null)} disabled={!selPages.some((p) => p.src)}>
-                ✂ Разрезать
+                ✂ Разрезать линиями
               </button>
+              {n === 1 && selPages[0].src && (
+                <button className="btn ghost small" onClick={() => setFragmenting(selPages[0])}>
+                  ⬚ Вырезать фрагменты
+                </button>
+              )}
               {n === 1 && selPages[0].src && (
                 <button className="btn ghost small" onClick={() => setEditing(selPages[0])}>
                   ✏️ Править
@@ -382,7 +402,7 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
               <div className="pg-actions" onClick={(e) => e.stopPropagation()}>
                 <button title="Посмотреть крупно" onClick={() => setPreview(p)}>🔍</button>
                 <button title="Повернуть" onClick={() => rotate([p.key], 90)}>⟳</button>
-                {p.src && <button title="Разрезать на части" onClick={() => setCutting(p)}>✂</button>}
+                {p.src && <button title="Вырезать фрагменты" onClick={() => setFragmenting(p)}>✂</button>}
                 {p.src && <button title="Править: дублировать или убрать элементы" onClick={() => setEditing(p)}>✏️</button>}
                 <button title="Дублировать" onClick={() => duplicate([p.key])}>⧉</button>
                 <button title="Удалить" onClick={() => remove([p.key])}>🗑</button>
@@ -449,6 +469,17 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
           allCount={pages.filter((p) => p.src).length}
           close={() => setCutting(null)}
           apply={(cells, scope) => cutPages(cells, scope, cutting)}
+        />
+      )}
+      {fragmenting && (
+        <FragmentsDialog
+          page={fragmenting}
+          close={() => setFragmenting(null)}
+          apply={(boxes, keep) => cutFragments(boxes, keep, fragmenting)}
+          openLines={() => {
+            setCutting(fragmenting)
+            setFragmenting(null)
+          }}
         />
       )}
       {editing && (
