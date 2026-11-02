@@ -1,4 +1,5 @@
 import { PDFDocument, degrees, rgb } from 'pdf-lib'
+import type { PDFPage } from 'pdf-lib'
 import { zipSync } from 'fflate'
 import { forgetPdf, openPdf, renderPage } from '../pdf'
 import { FULL, compose, fracToPdf } from './geom'
@@ -13,8 +14,35 @@ export interface Source {
   bytes: ArrayBuffer
 }
 
-/** Правка внутри листа: копия области или «заклеенная» белым область. Доли — от (обрезанного) листа без поворота. */
-export type Edit = { kind: 'copy'; from: FRect; to: FRect } | { kind: 'erase'; rect: FRect }
+/**
+ * Фрагмент, скопированный в «буфер»: часть какого-то листа.
+ * rect — доля от целого исходного листа (как его показывает просмотрщик), viewRot — как лист был повёрнут у нас на экране.
+ */
+export interface FragmentRef {
+  src: string
+  index: number
+  rect: FRect
+  viewRot: number
+  fw: number
+  fh: number
+}
+
+/** Размер фрагмента в пунктах так, как он виден на экране. */
+export function fragSize(f: FragmentRef) {
+  const w = f.rect.w * f.fw
+  const h = f.rect.h * f.fh
+  return f.viewRot % 180 ? { w: h, h: w } : { w, h }
+}
+
+/**
+ * Правка внутри листа. Доли — от (обрезанного) листа без нашего поворота.
+ *  copy  — копия области этого же листа;
+ *  erase — область, закрашенная белым;
+ *  place — вставленный фрагмент из буфера (с любого листа).
+ */
+export type Edit = { kind: 'copy'; from: FRect; to: FRect } | { kind: 'erase'; rect: FRect } | { kind: 'place'; frag: FragmentRef; to: FRect }
+
+const norm = (d: number) => (((d % 360) + 360) % 360)
 
 /** Один лист в рабочей области: ссылка на лист исходного файла (или пустой лист). */
 export interface PageRef {
@@ -59,18 +87,40 @@ export function blankPage(like?: PageRef): PageRef {
 export async function buildPdf(pages: PageRef[], sources: Map<string, Source>): Promise<Uint8Array> {
   const out = await PDFDocument.create()
   const loaded = new Map<string, PDFDocument>()
+  const getSrc = async (id: string) => {
+    let d = loaded.get(id)
+    if (!d) {
+      const s = sources.get(id)
+      if (!s) throw new Error('Исходный файл не найден')
+      d = await PDFDocument.load(s.bytes, { ignoreEncryption: true })
+      loaded.set(id, d)
+    }
+    return d
+  }
+
+  /** Вставляем фрагмент в прямоугольник T (координаты PDF) листа, который на экране повёрнут на totalTgt. */
+  const drawPlace = async (target: PDFPage, frag: FragmentRef, T: { x: number; y: number; w: number; h: number }, totalTgt: number) => {
+    const sp = (await getSrc(frag.src)).getPage(frag.index)
+    const r0s = sp.getRotation().angle
+    const F = fracToPdf(frag.rect, sp.getCropBox(), r0s)
+    const emb = await out.embedPage(sp, { left: F.x, bottom: F.y, right: F.x + F.w, top: F.y + F.h })
+    // насколько повернуть фрагмент, чтобы он выглядел так же, как там, откуда его скопировали
+    const phi = norm(totalTgt - (r0s + frag.viewRot))
+    if (phi === 90) target.drawPage(emb, { x: T.x + T.w, y: T.y, width: T.h, height: T.w, rotate: degrees(90) })
+    else if (phi === 180) target.drawPage(emb, { x: T.x + T.w, y: T.y + T.h, width: T.w, height: T.h, rotate: degrees(180) })
+    else if (phi === 270) target.drawPage(emb, { x: T.x, y: T.y + T.h, width: T.h, height: T.w, rotate: degrees(270) })
+    else target.drawPage(emb, { x: T.x, y: T.y, width: T.w, height: T.h })
+  }
+
   for (const p of pages) {
     if (!p.src) {
-      out.addPage([p.w, p.h])
+      const blank = out.addPage([p.w, p.h])
+      const box = { x: 0, y: 0, width: p.w, height: p.h }
+      for (const e of p.edits ?? []) if (e.kind === 'place') await drawPlace(blank, e.frag, fracToPdf(e.to, box, 0), p.rot)
+      if (p.rot) blank.setRotation(degrees(p.rot))
       continue
     }
-    let src = loaded.get(p.src)
-    if (!src) {
-      const s = sources.get(p.src)
-      if (!s) throw new Error('Исходный файл не найден')
-      src = await PDFDocument.load(s.bytes, { ignoreEncryption: true })
-      loaded.set(p.src, src)
-    }
+    const src = await getSrc(p.src)
     const [copy] = await out.copyPages(src, [p.index])
     if (p.crop || p.edits?.length) {
       const orig = src.getPage(p.index)
@@ -81,12 +131,14 @@ export async function buildPdf(pages: PageRef[], sources: Map<string, Source>): 
         if (e.kind === 'erase') {
           const R = fracToPdf(compose(crop, e.rect), box, r0)
           copy.drawRectangle({ x: R.x, y: R.y, width: R.w, height: R.h, color: rgb(1, 1, 1) })
-        } else {
+        } else if (e.kind === 'copy') {
           // копия области — векторная, без потери качества
           const F = fracToPdf(compose(crop, e.from), box, r0)
           const T = fracToPdf(compose(crop, e.to), box, r0)
           const emb = await out.embedPage(orig, { left: F.x, bottom: F.y, right: F.x + F.w, top: F.y + F.h })
           copy.drawPage(emb, { x: T.x, y: T.y, width: T.w, height: T.h })
+        } else {
+          await drawPlace(copy, e.frag, fracToPdf(compose(crop, e.to), box, r0), r0 + p.rot)
         }
       }
       if (p.crop) {
@@ -151,17 +203,47 @@ export async function saveGroups(groups: PageRef[][], sources: Map<string, Sourc
 // ---------- картинки листов для экрана ----------
 
 /** Целый исходный лист картинкой, достаточно крупной для нужной ширины куска. */
-export function fullRender(p: PageRef, pieceWidthPx: number) {
+export function fullRender(p: PageRef, pieceWidthPx: number): Promise<HTMLCanvasElement> {
   const need = pieceWidthPx / (p.crop?.w ?? 1)
   const w = need > 1200 ? 2000 : need > 600 ? 1200 : need > 300 ? 600 : 300
-  return renderPage(docId(p.src!), p.index, w)
+  if (!p.src) {
+    // пустой лист — просто белый
+    const c = document.createElement('canvas')
+    c.width = w
+    c.height = Math.round((w * p.fh) / p.fw)
+    const ctx = c.getContext('2d')!
+    ctx.fillStyle = '#fff'
+    ctx.fillRect(0, 0, c.width, c.height)
+    return Promise.resolve(c)
+  }
+  return renderPage(docId(p.src), p.index, w)
+}
+
+export type SourceCanvases = Map<string, HTMLCanvasElement>
+
+/** Картинки листов, с которых взяты вставленные фрагменты. */
+export async function placeSources(edits: Edit[] = []): Promise<SourceCanvases> {
+  const m: SourceCanvases = new Map()
+  for (const e of edits)
+    if (e.kind === 'place') {
+      const k = e.frag.src + ':' + e.frag.index
+      if (!m.has(k)) m.set(k, await renderPage(docId(e.frag.src), e.frag.index, 1200))
+    }
+  return m
+}
+
+/** Лист картинкой, как он будет в PDF (обрезка, правки, вставки, поворот). */
+export async function renderDisplay(p: PageRef, widthPx: number, edits = p.edits ?? []): Promise<HTMLCanvasElement> {
+  const turned = p.rot % 180 !== 0
+  const full = await fullRender(p, turned ? (widthPx * p.w) / p.h : widthPx)
+  return composeDisplay(full, p, widthPx, edits, await placeSources(edits))
 }
 
 /**
  * Рисует лист так, как он будет в PDF: обрезка, правки, поворот.
  * edits можно передать свои — для живого просмотра в редакторе.
  */
-export function composeDisplay(full: HTMLCanvasElement, p: PageRef, widthPx: number, edits = p.edits ?? []): HTMLCanvasElement {
+export function composeDisplay(full: HTMLCanvasElement, p: PageRef, widthPx: number, edits = p.edits ?? [], srcs: SourceCanvases = new Map()): HTMLCanvasElement {
   const crop = p.crop ?? FULL
   const FW = full.width
   const FH = full.height
@@ -178,10 +260,23 @@ export function composeDisplay(full: HTMLCanvasElement, p: PageRef, widthPx: num
         const r = px(compose(crop, e.rect))
         b.fillStyle = '#fff'
         b.fillRect(r.x, r.y, r.w, r.h)
-      } else {
+      } else if (e.kind === 'copy') {
         const f = px(compose(crop, e.from))
         const t = px(compose(crop, e.to))
         if (f.w > 0 && f.h > 0) b.drawImage(full, f.x, f.y, f.w, f.h, t.x, t.y, t.w, t.h)
+      } else {
+        const sc = srcs.get(e.frag.src + ':' + e.frag.index)
+        if (!sc) continue
+        const t = px(compose(crop, e.to))
+        const theta = norm(e.frag.viewRot - p.rot)
+        const fr = e.frag.rect
+        b.save()
+        b.translate(t.x + t.w / 2, t.y + t.h / 2)
+        b.rotate((theta * Math.PI) / 180)
+        const dw = theta % 180 ? t.h : t.w
+        const dh = theta % 180 ? t.w : t.h
+        b.drawImage(sc, fr.x * sc.width, fr.y * sc.height, fr.w * sc.width, fr.h * sc.height, -dw / 2, -dh / 2, dw, dh)
+        b.restore()
       }
     }
   }

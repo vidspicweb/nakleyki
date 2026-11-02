@@ -3,8 +3,8 @@ import { createPortal } from 'react-dom'
 import { useApp } from '../store'
 import { importFile } from '../importer'
 import { plural } from '../util'
-import { blankPage, buildPdf, composeDisplay, download, dropSource, fullRender, loadFile, parseRanges, saveGroups } from '../pdftools/engine'
-import type { Edit, PageRef, Source } from '../pdftools/engine'
+import { blankPage, buildPdf, download, dropSource, fragSize, loadFile, parseRanges, renderDisplay, saveGroups } from '../pdftools/engine'
+import type { Edit, FragmentRef, PageRef, Source } from '../pdftools/engine'
 import { CutDialog, EditDialog, FragmentsDialog } from '../pdftools/dialogs'
 import type { CutScope } from '../pdftools/dialogs'
 import { FULL, compose, rebase, toBase } from '../pdftools/geom'
@@ -29,7 +29,9 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
   const [preview, setPreview] = useState<PageRef | null>(null)
   const [cutting, setCutting] = useState<PageRef | null>(null)
   const [fragmenting, setFragmenting] = useState<PageRef | null>(null)
-  const [editing, setEditing] = useState<PageRef | null>(null)
+  const [editing, setEditing] = useState<{ page: PageRef; paste?: boolean } | null>(null)
+  const [clip, setClip] = useState<FragmentRef | null>(null)
+  const [clipUrl, setClipUrl] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   /** Любое изменение листов запоминаем, чтобы можно было отменить. */
@@ -100,8 +102,32 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
   const pieceOf = (p: PageRef, cell: FRect): PageRef => {
     const piece = toBase(cell, p.rot) // часть в координатах листа без поворота
     const crop = compose(p.crop ?? FULL, piece)
-    const edits = p.edits?.map((e): Edit => (e.kind === 'copy' ? { kind: 'copy', from: rebase(e.from, piece), to: rebase(e.to, piece) } : { kind: 'erase', rect: rebase(e.rect, piece) }))
+    const edits = p.edits?.map((e): Edit =>
+      e.kind === 'copy' ? { ...e, from: rebase(e.from, piece), to: rebase(e.to, piece) } : e.kind === 'place' ? { ...e, to: rebase(e.to, piece) } : { ...e, rect: rebase(e.rect, piece) },
+    )
     return { ...p, key: uid(), crop, edits, w: crop.w * p.fw, h: crop.h * p.fh }
+  }
+
+  /** Кладём фрагмент в «буфер»: его можно вставлять на любые листы сколько угодно раз. */
+  const copyFragment = (f: FragmentRef) => {
+    setClip(f)
+    // маленькая картинка фрагмента для плашки внизу
+    const fs = fragSize(f)
+    const probe: PageRef = { key: 'clip', src: f.src, index: f.index, rot: f.viewRot, w: f.rect.w * f.fw, h: f.rect.h * f.fh, fw: f.fw, fh: f.fh, crop: f.rect }
+    renderDisplay(probe, fs.w >= fs.h ? 120 : (120 * fs.w) / fs.h)
+      .then((c) => setClipUrl(c.toDataURL('image/png')))
+      .catch(() => setClipUrl(null))
+    toast('Фрагмент скопирован. Наведите на любой лист и нажмите 📋 — или «На новый лист» внизу')
+  }
+
+  /** Новый пустой лист сразу с вставленным фрагментом. */
+  const pasteToNewPage = () => {
+    if (!clip) return
+    const fs = fragSize(clip)
+    const b = blankPage(fs.w > fs.h * 1.15 ? { ...blankPage(), w: 842, h: 595 } as PageRef : undefined)
+    const lastSel = pagesRef.current.reduce((acc, p, i) => (sel.has(p.key) ? i : acc), -1)
+    setPages((cur) => (lastSel >= 0 ? [...cur.slice(0, lastSel + 1), b, ...cur.slice(lastSel + 1)] : [...cur, b]))
+    setEditing({ page: b, paste: true })
   }
 
   const cutFragments = (boxes: FRect[], keep: boolean, around: PageRef) => {
@@ -352,7 +378,7 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
                 </button>
               )}
               {n === 1 && selPages[0].src && (
-                <button className="btn ghost small" onClick={() => setEditing(selPages[0])}>
+                <button className="btn ghost small" onClick={() => setEditing({ page: selPages[0] })}>
                   ✏️ Править
                 </button>
               )}
@@ -403,7 +429,13 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
                 <button title="Посмотреть крупно" onClick={() => setPreview(p)}>🔍</button>
                 <button title="Повернуть" onClick={() => rotate([p.key], 90)}>⟳</button>
                 {p.src && <button title="Вырезать фрагменты" onClick={() => setFragmenting(p)}>✂</button>}
-                {p.src && <button title="Править: дублировать или убрать элементы" onClick={() => setEditing(p)}>✏️</button>}
+                {p.src && <button title="Править: дублировать или убрать элементы" onClick={() => setEditing({ page: p })}>✏️</button>}
+                {clip && (
+                  <button title="Вставить скопированный фрагмент на этот лист" onClick={() => setEditing({ page: p, paste: true })}>
+                    📋
+                  </button>
+                )}
+                {!p.src && !clip && p.edits?.length ? <button title="Править" onClick={() => setEditing({ page: p })}>✏️</button> : null}
                 <button title="Дублировать" onClick={() => duplicate([p.key])}>⧉</button>
                 <button title="Удалить" onClick={() => remove([p.key])}>🗑</button>
               </div>
@@ -476,6 +508,10 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
           page={fragmenting}
           close={() => setFragmenting(null)}
           apply={(boxes, keep) => cutFragments(boxes, keep, fragmenting)}
+          onCopy={(f) => {
+            copyFragment(f)
+            setFragmenting(null)
+          }}
           openLines={() => {
             setCutting(fragmenting)
             setFragmenting(null)
@@ -484,13 +520,31 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
       )}
       {editing && (
         <EditDialog
-          page={editing}
+          page={editing.page}
+          clip={clip}
+          pasteOnOpen={editing.paste}
+          onCopy={copyFragment}
           close={() => setEditing(null)}
           save={(edits) => {
-            setPages((cur) => cur.map((p) => (p.key === editing.key ? { ...p, edits } : p)))
+            setPages((cur) => cur.map((p) => (p.key === editing.page.key ? { ...p, edits } : p)))
             setEditing(null)
           }}
         />
+      )}
+      {clip && (
+        <div className="clip-chip">
+          {clipUrl ? <img src={clipUrl} alt="" /> : <span className="clip-icon">📋</span>}
+          <div className="clip-text">
+            <b>Фрагмент скопирован</b>
+            <span className="muted tiny">Наведите на лист и нажмите 📋</span>
+          </div>
+          <button className="btn primary small" onClick={pasteToNewPage}>
+            ➕ На новый лист
+          </button>
+          <button className="icon-btn" title="Очистить буфер" onClick={() => (setClip(null), setClipUrl(null))}>
+            ✕
+          </button>
+        </div>
       )}
     </div>
   )
@@ -514,11 +568,11 @@ function PageThumb({ page, width = 150 }: { page: PageRef; width?: number }) {
   }, [])
 
   useEffect(() => {
-    if (!visible || !page.src) return
+    if (!visible || (!page.src && !page.edits?.length)) return
     let alive = true
     const px = width * Math.min(2, devicePixelRatio || 1)
-    fullRender(page, turned ? (px * page.w) / page.h : px)
-      .then((full) => alive && setUrl(composeDisplay(full, page, px).toDataURL('image/jpeg', 0.85)))
+    renderDisplay(page, px)
+      .then((c) => alive && setUrl(c.toDataURL('image/jpeg', 0.85)))
       .catch(() => undefined)
     return () => {
       alive = false
@@ -527,7 +581,7 @@ function PageThumb({ page, width = 150 }: { page: PageRef; width?: number }) {
 
   return (
     <div ref={ref} className="pg-img" style={{ width: boxW, height: boxH }}>
-      {!page.src ? <div className="blank-page">пустой лист</div> : url ? <img src={url} alt="" draggable={false} /> : <div className="sheet-loading" />}
+      {!page.src && !page.edits?.length ? <div className="blank-page">пустой лист</div> : url ? <img src={url} alt="" draggable={false} /> : <div className="sheet-loading" />}
       {page.edits?.length ? <span className="pg-badge">✏️</span> : null}
     </div>
   )

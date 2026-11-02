@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { DEFAULT_GRID, detectGrid, gridCells } from '../pdf'
 import { plural } from '../util'
-import { composeDisplay, fullRender } from './engine'
-import type { Edit, PageRef } from './engine'
-import { cellsFromLines, clamp01, toBase, toDisplay } from './geom'
+import { composeDisplay, fragSize, fullRender, renderDisplay } from './engine'
+import type { Edit, FragmentRef, PageRef } from './engine'
+import { FULL, cellsFromLines, clamp01, compose, toBase, toDisplay } from './geom'
 import type { FRect } from './geom'
 
 /** Размер картинки листа в окне: влезает и по ширине, и по высоте. */
@@ -28,15 +28,57 @@ function useDisplayCanvas(page: PageRef, width: number, edits?: Edit[]) {
     }
   }, [page, width])
   useEffect(() => {
-    if (!full || !ref.current) return
+    let alive = true
     const dpr = Math.min(2, devicePixelRatio || 1)
-    const c = composeDisplay(full, page, width * dpr, edits)
-    const el = ref.current
-    el.width = c.width
-    el.height = c.height
-    el.getContext('2d')!.drawImage(c, 0, 0)
-  }, [full, page, width, edits])
+    renderDisplay(page, width * dpr, edits ?? page.edits ?? []).then((c) => {
+      const el = ref.current
+      if (!alive || !el) return
+      el.width = c.width
+      el.height = c.height
+      el.getContext('2d')!.drawImage(c, 0, 0)
+    })
+    return () => {
+      alive = false
+    }
+  }, [page, width, edits])
   return { ref, full }
+}
+
+/** Фрагмент из рамки (как видна на экране) на листе page. */
+export function fragmentFrom(page: PageRef, box: FRect): FragmentRef {
+  return { src: page.src!, index: page.index, rect: compose(page.crop ?? FULL, toBase(box, page.rot)), viewRot: page.rot, fw: page.fw, fh: page.fh }
+}
+
+/** Где поставить фрагмент на листе (доли, как видно на экране): по центру, в натуральную величину или меньше. */
+function placeCentered(page: PageRef, frag: FragmentRef, shift = 0): FRect {
+  const pw = page.rot % 180 ? page.h : page.w
+  const ph = page.rot % 180 ? page.w : page.h
+  const fs = fragSize(frag)
+  let w = fs.w / pw
+  let h = fs.h / ph
+  const k = Math.min(1, 0.9 / w, 0.9 / h)
+  w *= k
+  h *= k
+  return { x: Math.min(1 - w, Math.max(0, (1 - w) / 2 + shift)), y: Math.min(1 - h, Math.max(0, (1 - h) / 2 + shift)), w, h }
+}
+
+/** Раскладываем копии фрагмента сеткой cols × rows по листу. */
+function placeGrid(page: PageRef, frag: FragmentRef, cols: number, rows: number): FRect[] {
+  const pw = page.rot % 180 ? page.h : page.w
+  const ph = page.rot % 180 ? page.w : page.h
+  const fs = fragSize(frag)
+  const m = 0.03
+  const g = 0.015
+  const cw = (1 - 2 * m - g * (cols - 1)) / cols
+  const ch = (1 - 2 * m - g * (rows - 1)) / rows
+  // вписываем, сохраняя пропорции фрагмента (в пунктах)
+  const k = Math.min((cw * pw) / fs.w, (ch * ph) / fs.h)
+  const w = (fs.w * k) / pw
+  const h = (fs.h * k) / ph
+  const out: FRect[] = []
+  for (let r = 0; r < rows; r++)
+    for (let c = 0; c < cols; c++) out.push({ x: m + c * (cw + g) + (cw - w) / 2, y: m + r * (ch + g) + (ch - h) / 2, w, h })
+  return out
 }
 
 /* ============================== РАЗРЕЗАТЬ ============================== */
@@ -231,12 +273,30 @@ type Drag =
   | { mode: 'move'; i: number; sx: number; sy: number; start: FRect }
   | { mode: 'resize'; i: number; sx: number; sy: number; start: FRect; keep: boolean }
 
-export function EditDialog({ page, close, save }: { page: PageRef; close: () => void; save: (edits: Edit[]) => void }) {
+export function EditDialog({
+  page,
+  close,
+  save,
+  clip,
+  onCopy,
+  pasteOnOpen,
+}: {
+  page: PageRef
+  close: () => void
+  save: (edits: Edit[]) => void
+  clip: FragmentRef | null
+  onCopy: (f: FragmentRef) => void
+  pasteOnOpen?: boolean
+}) {
   const size = fitSize(page, Math.min(760, window.innerWidth - 400), window.innerHeight - 200)
-  const [edits, setEdits] = useState<Edit[]>(page.edits ?? [])
+  const [edits, setEdits] = useState<Edit[]>(() => {
+    const base0 = page.edits ?? []
+    if (pasteOnOpen && clip) return [...base0, { kind: 'place', frag: clip, to: toBase(placeCentered(page, clip), page.rot) }]
+    return base0
+  })
   const { ref } = useDisplayCanvas(page, size.w, edits)
   const [sel, setSel] = useState<FRect | null>(null) // выделение (как видно на экране)
-  const [active, setActive] = useState<number | null>(null)
+  const [active, setActive] = useState<number | null>(() => (pasteOnOpen && clip ? (page.edits ?? []).length : null))
   const drag = useRef<Drag | null>(null)
   const box = useRef<HTMLDivElement>(null)
 
@@ -246,9 +306,9 @@ export function EditDialog({ page, close, save }: { page: PageRef; close: () => 
     const r = box.current!.getBoundingClientRect()
     return { x: clamp01((e.clientX - r.left) / r.width), y: clamp01((e.clientY - r.top) / r.height) }
   }
-  const editRect = (e: Edit) => (e.kind === 'copy' ? e.to : e.rect)
+  const editRect = (e: Edit) => (e.kind === 'erase' ? e.rect : e.to)
   const setEditRect = (i: number, r: FRect) =>
-    setEdits((all) => all.map((e, j) => (j !== i ? e : e.kind === 'copy' ? { ...e, to: base(r) } : { ...e, rect: base(r) })))
+    setEdits((all) => all.map((e, j) => (j !== i ? e : e.kind === 'erase' ? { ...e, rect: base(r) } : { ...e, to: base(r) })))
 
   const down = (e: React.PointerEvent) => {
     const p = pos(e)
@@ -288,7 +348,7 @@ export function EditDialog({ page, close, save }: { page: PageRef; close: () => 
     e.preventDefault()
     const p = pos(e)
     const start = disp(editRect(edits[i]))
-    drag.current = mode === 'move' ? { mode, i, sx: p.x, sy: p.y, start } : { mode, i, sx: p.x, sy: p.y, start, keep: edits[i].kind === 'copy' }
+    drag.current = mode === 'move' ? { mode, i, sx: p.x, sy: p.y, start } : { mode, i, sx: p.x, sy: p.y, start, keep: edits[i].kind !== 'erase' }
     setActive(i)
     setSel(null)
     box.current?.setPointerCapture(e.pointerId)
@@ -305,6 +365,25 @@ export function EditDialog({ page, close, save }: { page: PageRef; close: () => 
     if (!sel) return
     setEdits((a) => [...a, { kind: 'erase', rect: base(sel) }])
     setSel(null)
+  }
+  const copySel = () => {
+    if (!sel || !page.src) return
+    onCopy(fragmentFrom(page, sel))
+    setSel(null)
+  }
+  const paste = () => {
+    if (!clip) return
+    const n = edits.filter((e) => e.kind === 'place').length
+    setEdits((a) => [...a, { kind: 'place', frag: clip, to: base(placeCentered(page, clip, (n % 5) * 0.03)) }])
+    setActive(edits.length)
+  }
+  const pasteGrid = (c: number, r: number) => {
+    if (!clip) return
+    const cells = placeGrid(page, clip, c, r)
+    const before = (page.edits ?? []).length
+    // вставки, сделанные в этом окне, заменяем сеткой (иначе копии лягут друг на друга)
+    setEdits((a) => [...a.filter((e, i) => i < before || e.kind !== 'place'), ...cells.map((cell): Edit => ({ kind: 'place', frag: clip, to: base(cell) }))])
+    setActive(null)
   }
   const removeEdit = (i: number) => {
     setEdits((a) => a.filter((_, j) => j !== i))
@@ -334,10 +413,10 @@ export function EditDialog({ page, close, save }: { page: PageRef; close: () => 
             {edits.map((e, i) => (
               <div
                 key={i}
-                className={'edit-box ' + e.kind + (active === i ? ' on' : '')}
+                className={'edit-box ' + (e.kind === 'place' ? 'copy' : e.kind) + (active === i ? ' on' : '')}
                 style={pct(disp(editRect(e)))}
                 onPointerDown={(ev) => startEditDrag(ev, i, 'move')}
-                title={e.kind === 'copy' ? 'Копия — потяните, чтобы переставить' : 'Убранная область'}
+                title={e.kind === 'erase' ? 'Убранная область' : 'Копия — потяните, чтобы переставить'}
               >
                 <span className="edit-handle" onPointerDown={(ev) => startEditDrag(ev, i, 'resize')} title="Потяните, чтобы изменить размер" />
                 {active === i && (
@@ -352,7 +431,7 @@ export function EditDialog({ page, close, save }: { page: PageRef; close: () => 
           <div className="cut-side">
             {!sel ? (
               <div className="hint">
-                <b>Обведите мышкой</b> карточку, надпись или картинку на листе — появятся кнопки «Дублировать» и «Убрать».
+                <b>Обведите мышкой</b> карточку, надпись или картинку на листе — появятся кнопки «Дублировать», «Копировать» и «Убрать».
               </div>
             ) : (
               <div className="sel-box">
@@ -360,12 +439,40 @@ export function EditDialog({ page, close, save }: { page: PageRef; close: () => 
                 <button className="btn primary full" onClick={duplicate} disabled={sel.w < 0.01}>
                   ⧉ Дублировать
                 </button>
+                {page.src && (
+                  <button className="btn soft full" onClick={copySel} disabled={sel.w < 0.01}>
+                    📋 Копировать — вставить на другой лист
+                  </button>
+                )}
                 <button className="btn ghost full" onClick={erase} disabled={sel.w < 0.01}>
                   ⬜ Убрать (закрасить белым)
                 </button>
                 <button className="link-btn" onClick={() => setSel(null)}>
                   Снять выделение
                 </button>
+              </div>
+            )}
+            {clip && (
+              <div className="clip-box">
+                <b>📋 Фрагмент в буфере</b>
+                <button className="btn primary full" onClick={paste}>
+                  Вставить на этот лист
+                </button>
+                <div className="muted tiny">Разложить копиями по всему листу:</div>
+                <div className="grid-btns">
+                  {[
+                    [1, 2],
+                    [2, 2],
+                    [2, 3],
+                    [2, 4],
+                    [3, 3],
+                    [3, 4],
+                  ].map(([c, r]) => (
+                    <button key={c + 'x' + r} className="btn ghost small" onClick={() => pasteGrid(c, r)}>
+                      {c} × {r}
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
             <ul className="muted tiny tips">
@@ -380,7 +487,7 @@ export function EditDialog({ page, close, save }: { page: PageRef; close: () => 
                 <div className="edit-list">
                   {edits.map((e, i) => (
                     <div key={i} className={'edit-row' + (active === i ? ' on' : '')} onClick={() => setActive(i)}>
-                      <span>{e.kind === 'copy' ? '⧉ Копия' : '⬜ Убрано'}</span>
+                      <span>{e.kind === 'copy' ? '⧉ Копия' : e.kind === 'place' ? '📋 Вставка' : '⬜ Убрано'}</span>
                       <button className="icon-btn" onClick={(ev) => (ev.stopPropagation(), removeEdit(i))} title="Удалить правку">
                         ✕
                       </button>
@@ -425,11 +532,13 @@ export function FragmentsDialog({
   close,
   apply,
   openLines,
+  onCopy,
 }: {
   page: PageRef
   close: () => void
   apply: (boxes: FRect[], keepOriginal: boolean) => void
   openLines: () => void
+  onCopy: (f: FragmentRef) => void
 }) {
   const size = fitSize(page, Math.min(820, window.innerWidth - 400), window.innerHeight - 190)
   const { ref, full } = useDisplayCanvas(page, size.w)
@@ -593,6 +702,17 @@ export function FragmentsDialog({
                 'Пока нет ни одной рамки'
               )}
             </div>
+            {boxes.length > 0 && (
+              <div className="clip-box">
+                <b>📋 Нужно вставить фрагмент на другой лист?</b>
+                <span className="muted tiny">
+                  {boxes.length > 1 ? `Скопируется рамка № ${(active ?? boxes.length - 1) + 1} (выделенная). ` : ''}Потом наведите на любой лист и нажмите 📋 — или вставьте на новый пустой лист.
+                </span>
+                <button className="btn soft full" onClick={() => onCopy(fragmentFrom(page, trimBoxes([boxes[active ?? boxes.length - 1]])[0]))}>
+                  📋 Копировать фрагмент
+                </button>
+              </div>
+            )}
             <button className="link-btn" onClick={openLines}>
               Нужно разрезать весь лист ровно на части? Разрезать линиями →
             </button>
