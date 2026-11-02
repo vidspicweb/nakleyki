@@ -11,6 +11,7 @@ const classicWorker = workerSrc.replace(/export\s*\{[^}]*\}\s*;?\s*$/, '')
 pdfjs.GlobalWorkerOptions.workerPort = new Worker(URL.createObjectURL(new Blob([classicWorker], { type: 'text/javascript' })))
 
 const docs = new Map<string, Promise<PDFDocumentProxy>>()
+const renders = new Map<string, Promise<HTMLCanvasElement>>()
 
 export function openPdf(templateId: string, bytes?: ArrayBuffer): Promise<PDFDocumentProxy> {
   let p = docs.get(templateId)
@@ -28,10 +29,11 @@ export function openPdf(templateId: string, bytes?: ArrayBuffer): Promise<PDFDoc
 }
 
 export function forgetPdf(templateId: string) {
+  const d = docs.get(templateId)
   docs.delete(templateId)
+  d?.then((x) => x.destroy()).catch(() => undefined)
+  for (const k of [...renders.keys()]) if (k.startsWith(templateId + ':')) renders.delete(k)
 }
-
-const renders = new Map<string, Promise<HTMLCanvasElement>>()
 
 /** Картинка страницы шириной примерно `width` пикселей (с кэшем). */
 export function renderPage(templateId: string, pageIndex: number, width: number): Promise<HTMLCanvasElement> {
