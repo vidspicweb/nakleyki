@@ -3,6 +3,7 @@ import { useApp } from '../store'
 import type { Tab } from '../App'
 import { buildPdf, planPages } from '../export'
 import { SheetPreview } from '../components/SheetPreview'
+import { SheetPicker } from '../components/SheetPicker'
 import { plural } from '../util'
 
 export function PrintPage({ goTab }: { goTab: (t: Tab) => void }) {
@@ -111,23 +112,7 @@ export function PrintPage({ goTab }: { goTab: (t: Tab) => void }) {
             <h2>
               <span className="n-badge">2</span> Какие наклейки
             </h2>
-            <div className="row gap-s">
-              <button className="link-btn" onClick={() => update((d) => void (d.print.sheetIds = d.sheets.map((s) => s.id)))}>
-                Выбрать все
-              </button>
-              <button className="link-btn" onClick={() => update((d) => void (d.print.sheetIds = []))}>
-                Снять все
-              </button>
-            </div>
-            <div className="pick-grid">
-              {state.sheets.map((s) => (
-                <label key={s.id} className={'pick' + (sheetIds.includes(s.id) ? ' on' : '')}>
-                  <input type="checkbox" checked={sheetIds.includes(s.id)} onChange={() => toggle('sheetIds', s.id)} />
-                  <SheetPreview sheet={s} width={96} />
-                  <span>{s.name}</span>
-                </label>
-              ))}
-            </div>
+            <SheetPicker sheets={state.sheets} selected={sheetIds} onChange={(ids) => update((d) => void (d.print.sheetIds = ids))} />
           </div>
         </div>
 

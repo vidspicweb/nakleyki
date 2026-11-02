@@ -10,7 +10,7 @@ export type Tab = 'students' | 'templates' | 'editor' | 'print'
 
 const TABS: { id: Tab; num: number; title: string; sub: string; icon: string }[] = [
   { id: 'students', num: 1, title: 'Ученики', sub: 'списки классов', icon: '🧒' },
-  { id: 'templates', num: 2, title: 'Шаблоны', sub: 'PDF с наклейками', icon: '🖼️' },
+  { id: 'templates', num: 2, title: 'Библиотека', sub: 'ваши шаблоны', icon: '🖼️' },
   { id: 'editor', num: 3, title: 'Настройка', sub: 'как разместить текст', icon: '✏️' },
   { id: 'print', num: 4, title: 'Печать', sub: 'готовый PDF', icon: '🖨️' },
 ]

@@ -13,7 +13,7 @@ export function SettingsMenu() {
     const blob = await exportBackup(state)
     const a = document.createElement('a')
     a.href = URL.createObjectURL(blob)
-    a.download = `Наклейки — копия ${new Date().toLocaleDateString('ru-RU')}.json`
+    a.download = `Наклейки — копия ${new Date().toLocaleDateString('ru-RU')}.nakl`
     a.click()
     setTimeout(() => URL.revokeObjectURL(a.href), 5000)
     toast('Копия сохранена в «Загрузки»')
@@ -41,14 +41,14 @@ export function SettingsMenu() {
       {open && (
         <div className="settings-pop" onMouseLeave={() => setOpen(false)}>
           <div className="settings-title">Ваши данные</div>
-          <p className="muted tiny">Всё хранится только в этом браузере на этом компьютере. Иногда сохраняйте копию — на случай чистки браузера или переезда на другой компьютер.</p>
+          <p className="muted tiny">Библиотека, ученики и настройки хранятся в этом браузере на этом компьютере. Иногда сохраняйте копию — на случай чистки браузера или переезда на другой компьютер. В копию входят все шаблоны и шрифты.</p>
           <button className="btn soft full" onClick={save}>
             💾 Сохранить копию в файл
           </button>
           <button className="btn ghost full" onClick={() => fileRef.current?.click()}>
             📂 Восстановить из файла
           </button>
-          <input ref={fileRef} type="file" hidden accept=".json,application/json" onChange={(e) => e.target.files?.[0] && load(e.target.files[0]).then(() => (e.target.value = ''))} />
+          <input ref={fileRef} type="file" hidden accept=".nakl,.json" onChange={(e) => e.target.files?.[0] && load(e.target.files[0]).then(() => (e.target.value = ''))} />
         </div>
       )}
     </div>

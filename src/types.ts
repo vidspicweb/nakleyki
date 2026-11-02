@@ -55,6 +55,8 @@ export interface TemplateFile {
   id: string
   name: string
   pageCount: number
+  kind?: 'pdf' | 'image'
+  addedAt?: number
 }
 
 /** Одна страница PDF = один дизайн наклеек */
@@ -68,6 +70,8 @@ export interface Sheet {
   layout: Layout
   widthPt: number
   heightPt: number
+  tags?: string[] // метки для поиска: «Математика», «Для девочек»…
+  addedAt?: number
 }
 
 export interface UploadedFont {
@@ -84,6 +88,7 @@ export interface AppState {
   activeClassId?: string
   activeSheetId?: string
   lastLayout?: Layout
+  customTags?: string[] // метки, которые пользователь придумал сам
   print: { classIds: string[]; sheetIds: string[]; copies: number }
 }
 

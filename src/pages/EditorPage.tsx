@@ -7,7 +7,12 @@ import { StickerCanvas } from '../components/StickerCanvas'
 import { SheetPreview } from '../components/SheetPreview'
 import { FontPicker } from '../components/FontPicker'
 import { detectGrid, renderPage } from '../pdf'
-import { clamp } from '../util'
+import { clamp, plural } from '../util'
+import { Thumb } from '../components/Thumb'
+import { SheetPicker } from '../components/SheetPicker'
+import { FilterBar } from '../components/Tags'
+import { filterSheets } from '../tags'
+import type { SheetFilter } from '../tags'
 
 const COLORS = ['#1b1f3b', '#000000', '#1d4ed8', '#7c3aed', '#be123c', '#047857', '#c2410c']
 
@@ -19,6 +24,11 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
   const [studentIdx, setStudentIdx] = useState(0)
   const [showApply, setShowApply] = useState(false)
   const [showGrid, setShowGrid] = useState(false)
+  const [stripFilter, setStripFilter] = useState<SheetFilter>({ q: '', tags: [] })
+  const stripSheets = useMemo(() => {
+    const names = new Map(state.templates.map((t) => [t.id, t.name]))
+    return filterSheets(state.sheets, stripFilter, (s) => names.get(s.templateId) ?? '')
+  }, [state.sheets, state.templates, stripFilter])
   const stageWrap = useRef<HTMLDivElement>(null)
   const [stageW, setStageW] = useState(640)
 
@@ -103,17 +113,21 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
       </div>
 
       {state.sheets.length > 1 && (
-        <div className="sheet-strip">
-          {state.sheets.map((s) => (
-            <button key={s.id} className={'strip-item' + (s.id === sheet.id ? ' active' : '')} onClick={() => {
-              update((d) => void (d.activeSheetId = s.id))
-              setSelectedId(null)
-              setCellIndex(0)
-            }}>
-              <SheetPreview sheet={s} width={64} />
-              <span>{s.name}</span>
-            </button>
-          ))}
+        <div className="strip-wrap">
+          {state.sheets.length > 6 && <FilterBar compact filter={stripFilter} setFilter={setStripFilter} sheets={stripSheets} total={state.sheets.length} />}
+          <div className="sheet-strip">
+            {stripSheets.map((s) => (
+              <button key={s.id} className={'strip-item' + (s.id === sheet.id ? ' active' : '')} onClick={() => {
+                update((d) => void (d.activeSheetId = s.id))
+                setSelectedId(null)
+                setCellIndex(0)
+              }}>
+                <Thumb sheet={s} width={64} />
+                <span>{s.name}</span>
+              </button>
+            ))}
+            {stripSheets.length === 0 && <div className="muted pad">Ничего не нашлось</div>}
+          </div>
         </div>
       )}
 
@@ -451,25 +465,13 @@ function GridEditor({ sheet, onChange }: { sheet: Sheet; onChange: (g: Grid) => 
 function ApplyDialog({ sheet, close }: { sheet: Sheet; close: () => void }) {
   const { state, update, toast } = useApp()
   const others = state.sheets.filter((s) => s.id !== sheet.id)
-  const [ids, setIds] = useState<string[]>(others.map((s) => s.id))
+  const [ids, setIds] = useState<string[]>([])
   return (
     <div className="modal-back" onClick={close}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h2>Применить настройку к другим шаблонам</h2>
         <p className="muted">Строки, шрифты и их места с «{sheet.name}» будут скопированы в выбранные шаблоны.</p>
-        <div className="row gap-s">
-          <button className="link-btn" onClick={() => setIds(others.map((s) => s.id))}>Выбрать все</button>
-          <button className="link-btn" onClick={() => setIds([])}>Снять все</button>
-        </div>
-        <div className="pick-grid">
-          {others.map((s) => (
-            <label key={s.id} className={'pick' + (ids.includes(s.id) ? ' on' : '')}>
-              <input type="checkbox" checked={ids.includes(s.id)} onChange={(e) => setIds((v) => (e.target.checked ? [...v, s.id] : v.filter((x) => x !== s.id)))} />
-              <SheetPreview sheet={s} width={90} />
-              <span>{s.name}</span>
-            </label>
-          ))}
-        </div>
+        <SheetPicker sheets={others} selected={ids} onChange={setIds} />
         <div className="row end gap-s">
           <button className="btn ghost" onClick={close}>
             Отмена
@@ -481,7 +483,7 @@ function ApplyDialog({ sheet, close }: { sheet: Sheet; close: () => void }) {
               update((d) => {
                 for (const s of d.sheets) if (ids.includes(s.id)) s.layout = cloneLayout(sheet.layout)
               })
-              toast(`Настройка применена к ${ids.length} шаблонам`)
+              toast(`Настройка применена: ${ids.length} ${plural(ids.length, 'шаблон', 'шаблона', 'шаблонов')}`)
               close()
             }}
           >

@@ -33,14 +33,31 @@ export const saveFontFile = (id: string, bytes: ArrayBuffer) => set('font:' + id
 export const loadFontFile = (id: string) => get<ArrayBuffer>('font:' + id, store)
 export const deleteFontFile = (id: string) => del('font:' + id, store)
 
+export const saveThumb = (sheetId: string, blob: Blob) => set('thumb:' + sheetId, blob, store)
+export const loadThumb = (sheetId: string) => get<Blob>('thumb:' + sheetId, store)
+export const deleteThumb = (sheetId: string) => del('thumb:' + sheetId, store)
+
+/** Просим браузер не удалять библиотеку при нехватке места. */
+export async function askPersistentStorage() {
+  try {
+    if (navigator.storage?.persisted && !(await navigator.storage.persisted())) await navigator.storage.persist()
+  } catch {
+    /* не страшно */
+  }
+}
+
+export async function storageInfo(): Promise<{ usedMb: number; quotaMb: number; persisted: boolean } | null> {
+  try {
+    const e = await navigator.storage.estimate()
+    const persisted = (await navigator.storage.persisted?.()) ?? false
+    return { usedMb: (e.usage ?? 0) / 1048576, quotaMb: (e.quota ?? 0) / 1048576, persisted }
+  } catch {
+    return null
+  }
+}
+
 // ---------- резервная копия всех данных в один файл ----------
 
-const toB64 = (buf: ArrayBuffer) => {
-  const bytes = new Uint8Array(buf)
-  let s = ''
-  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
-  return btoa(s)
-}
 const fromB64 = (b64: string) => {
   const s = atob(b64)
   const out = new Uint8Array(s.length)
@@ -48,21 +65,46 @@ const fromB64 = (b64: string) => {
   return out.buffer
 }
 
+/*
+ * Формат копии: «NAKL2» + длина заголовка (4 байта) + JSON-заголовок + файлы подряд.
+ * Файлы не превращаем в текст — так копия библиотеки на сотни мегабайт не «подвешивает» браузер.
+ */
+const MAGIC = 'NAKL2'
+
 export async function exportBackup(state: AppState): Promise<Blob> {
-  const pdfs: Record<string, string> = {}
+  const parts: BlobPart[] = []
+  const index: { kind: 'pdf' | 'font'; id: string; size: number }[] = []
   for (const t of state.templates) {
     const b = await loadPdf(t.id)
-    if (b) pdfs[t.id] = toB64(b)
+    if (b) (index.push({ kind: 'pdf', id: t.id, size: b.byteLength }), parts.push(b))
   }
-  const fonts: Record<string, string> = {}
   for (const f of state.fonts) {
     const b = await loadFontFile(f.id)
-    if (b) fonts[f.id] = toB64(b)
+    if (b) (index.push({ kind: 'font', id: f.id, size: b.byteLength }), parts.push(b))
   }
-  return new Blob([JSON.stringify({ app: 'nakleyki', state, pdfs, fonts })], { type: 'application/json' })
+  const head = new TextEncoder().encode(JSON.stringify({ app: 'nakleyki', state, index }))
+  const len = new Uint8Array(4)
+  new DataView(len.buffer).setUint32(0, head.byteLength)
+  return new Blob([MAGIC, len, head, ...parts], { type: 'application/octet-stream' })
 }
 
 export async function importBackup(file: File): Promise<AppState> {
+  const magic = await file.slice(0, 5).text()
+  if (magic === MAGIC) {
+    const len = new DataView(await file.slice(5, 9).arrayBuffer()).getUint32(0)
+    const data = JSON.parse(await file.slice(9, 9 + len).text())
+    let pos = 9 + len
+    for (const it of data.index as { kind: string; id: string; size: number }[]) {
+      const buf = await file.slice(pos, pos + it.size).arrayBuffer()
+      pos += it.size
+      if (it.kind === 'pdf') await savePdf(it.id, buf)
+      else await saveFontFile(it.id, buf)
+    }
+    const state = { ...DEFAULT_STATE, ...data.state } as AppState
+    await saveState(state)
+    return state
+  }
+  // старый формат (JSON)
   const data = JSON.parse(await file.text())
   if (data?.app !== 'nakleyki' || !data.state) throw new Error('Это не файл резервной копии наклеек')
   for (const [id, b64] of Object.entries<string>(data.pdfs ?? {})) await savePdf(id, fromB64(b64))
