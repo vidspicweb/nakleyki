@@ -1,6 +1,8 @@
-import { PDFDocument, degrees } from 'pdf-lib'
+import { PDFDocument, degrees, rgb } from 'pdf-lib'
 import { zipSync } from 'fflate'
-import { forgetPdf, openPdf } from '../pdf'
+import { forgetPdf, openPdf, renderPage } from '../pdf'
+import { FULL, compose, fracToPdf } from './geom'
+import type { FRect } from './geom'
 import { imageToPdf, isImage, isPdf } from '../importer'
 import { uid } from '../util'
 
@@ -11,14 +13,21 @@ export interface Source {
   bytes: ArrayBuffer
 }
 
+/** Правка внутри листа: копия области или «заклеенная» белым область. Доли — от (обрезанного) листа без поворота. */
+export type Edit = { kind: 'copy'; from: FRect; to: FRect } | { kind: 'erase'; rect: FRect }
+
 /** Один лист в рабочей области: ссылка на лист исходного файла (или пустой лист). */
 export interface PageRef {
   key: string
   src: string | null // null — пустой лист
   index: number
   rot: number // дополнительный поворот: 0, 90, 180, 270
-  w: number // размер в пунктах (как видно на экране, без нашего поворота)
+  w: number // размер в пунктах (как видно на экране, без нашего поворота; с учётом обрезки)
   h: number
+  fw: number // размер целого исходного листа
+  fh: number
+  crop?: FRect // какая часть исходного листа (после разрезания)
+  edits?: Edit[]
 }
 
 export const docId = (srcId: string) => 'tool:' + srcId
@@ -31,7 +40,7 @@ export async function loadFile(file: File): Promise<{ source: Source; pages: Pag
   const pages: PageRef[] = []
   for (let i = 0; i < doc.numPages; i++) {
     const v = (await doc.getPage(i + 1)).getViewport({ scale: 1 })
-    pages.push({ key: uid(), src: source.id, index: i, rot: 0, w: v.width, h: v.height })
+    pages.push({ key: uid(), src: source.id, index: i, rot: 0, w: v.width, h: v.height, fw: v.width, fh: v.height })
   }
   return { source, pages }
 }
@@ -43,7 +52,7 @@ export function dropSource(id: string) {
 export function blankPage(like?: PageRef): PageRef {
   const portrait = !like || like.h >= like.w
   const [w, h] = portrait ? [595.28, 841.89] : [841.89, 595.28]
-  return { key: uid(), src: null, index: 0, rot: 0, w, h }
+  return { key: uid(), src: null, index: 0, rot: 0, w, h, fw: w, fh: h }
 }
 
 /** Собираем PDF из листов. Листы копируются как есть — без потери качества. */
@@ -63,6 +72,32 @@ export async function buildPdf(pages: PageRef[], sources: Map<string, Source>): 
       loaded.set(p.src, src)
     }
     const [copy] = await out.copyPages(src, [p.index])
+    if (p.crop || p.edits?.length) {
+      const orig = src.getPage(p.index)
+      const box = orig.getCropBox()
+      const r0 = orig.getRotation().angle
+      const crop = p.crop ?? FULL
+      for (const e of p.edits ?? []) {
+        if (e.kind === 'erase') {
+          const R = fracToPdf(compose(crop, e.rect), box, r0)
+          copy.drawRectangle({ x: R.x, y: R.y, width: R.w, height: R.h, color: rgb(1, 1, 1) })
+        } else {
+          // копия области — векторная, без потери качества
+          const F = fracToPdf(compose(crop, e.from), box, r0)
+          const T = fracToPdf(compose(crop, e.to), box, r0)
+          const emb = await out.embedPage(orig, { left: F.x, bottom: F.y, right: F.x + F.w, top: F.y + F.h })
+          copy.drawPage(emb, { x: T.x, y: T.y, width: T.w, height: T.h })
+        }
+      }
+      if (p.crop) {
+        const C = fracToPdf(p.crop, box, r0)
+        copy.setMediaBox(C.x, C.y, C.w, C.h)
+        copy.setCropBox(C.x, C.y, C.w, C.h)
+        copy.setTrimBox(C.x, C.y, C.w, C.h)
+        copy.setBleedBox(C.x, C.y, C.w, C.h)
+        copy.setArtBox(C.x, C.y, C.w, C.h)
+      }
+    }
     if (p.rot) copy.setRotation(degrees((copy.getRotation().angle + p.rot) % 360))
     out.addPage(copy)
   }
@@ -111,4 +146,59 @@ export async function saveGroups(groups: PageRef[][], sources: Map<string, Sourc
   }
   const zip = zipSync(files, { level: 0 })
   download(new Blob([zip as BlobPart], { type: 'application/zip' }), base + ' (разделено).zip')
+}
+
+// ---------- картинки листов для экрана ----------
+
+/** Целый исходный лист картинкой, достаточно крупной для нужной ширины куска. */
+export function fullRender(p: PageRef, pieceWidthPx: number) {
+  const need = pieceWidthPx / (p.crop?.w ?? 1)
+  const w = need > 1200 ? 2000 : need > 600 ? 1200 : need > 300 ? 600 : 300
+  return renderPage(docId(p.src!), p.index, w)
+}
+
+/**
+ * Рисует лист так, как он будет в PDF: обрезка, правки, поворот.
+ * edits можно передать свои — для живого просмотра в редакторе.
+ */
+export function composeDisplay(full: HTMLCanvasElement, p: PageRef, widthPx: number, edits = p.edits ?? []): HTMLCanvasElement {
+  const crop = p.crop ?? FULL
+  const FW = full.width
+  const FH = full.height
+  const px = (r: FRect) => ({ x: r.x * FW, y: r.y * FH, w: r.w * FW, h: r.h * FH })
+  let base = full
+  if (edits.length) {
+    base = document.createElement('canvas')
+    base.width = FW
+    base.height = FH
+    const b = base.getContext('2d')!
+    b.drawImage(full, 0, 0)
+    for (const e of edits) {
+      if (e.kind === 'erase') {
+        const r = px(compose(crop, e.rect))
+        b.fillStyle = '#fff'
+        b.fillRect(r.x, r.y, r.w, r.h)
+      } else {
+        const f = px(compose(crop, e.from))
+        const t = px(compose(crop, e.to))
+        if (f.w > 0 && f.h > 0) b.drawImage(full, f.x, f.y, f.w, f.h, t.x, t.y, t.w, t.h)
+      }
+    }
+  }
+  const c = px(crop)
+  const turned = p.rot % 180 !== 0
+  const outW = Math.max(1, Math.round(widthPx))
+  const outH = Math.max(1, Math.round(turned ? (widthPx * c.w) / c.h : (widthPx * c.h) / c.w))
+  const out = document.createElement('canvas')
+  out.width = outW
+  out.height = outH
+  const ctx = out.getContext('2d')!
+  ctx.fillStyle = '#fff'
+  ctx.fillRect(0, 0, outW, outH)
+  ctx.translate(outW / 2, outH / 2)
+  ctx.rotate((p.rot * Math.PI) / 180)
+  const dw = turned ? outH : outW
+  const dh = turned ? outW : outH
+  ctx.drawImage(base, c.x, c.y, c.w, c.h, -dw / 2, -dh / 2, dw, dh)
+  return out
 }

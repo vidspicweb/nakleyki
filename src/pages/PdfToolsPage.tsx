@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useApp } from '../store'
-import { renderPage } from '../pdf'
 import { importFile } from '../importer'
 import { plural } from '../util'
-import { blankPage, buildPdf, docId, download, dropSource, loadFile, parseRanges, saveGroups } from '../pdftools/engine'
-import type { PageRef, Source } from '../pdftools/engine'
+import { blankPage, buildPdf, composeDisplay, download, dropSource, fullRender, loadFile, parseRanges, saveGroups } from '../pdftools/engine'
+import type { Edit, PageRef, Source } from '../pdftools/engine'
+import { CutDialog, EditDialog } from '../pdftools/dialogs'
+import type { CutScope } from '../pdftools/dialogs'
+import { FULL, compose, rebase, toBase } from '../pdftools/geom'
+import type { FRect } from '../pdftools/geom'
+import { uid } from '../util'
 
 type SplitMode = 'each' | 'every' | 'ranges' | 'selected'
 
@@ -23,6 +27,8 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
   const [fileOver, setFileOver] = useState(false)
   const [split, setSplit] = useState(false)
   const [preview, setPreview] = useState<PageRef | null>(null)
+  const [cutting, setCutting] = useState<PageRef | null>(null)
+  const [editing, setEditing] = useState<PageRef | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   /** Любое изменение листов запоминаем, чтобы можно было отменить. */
@@ -87,6 +93,27 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
     const like = pages[lastSel >= 0 ? lastSel : pages.length - 1]
     const b = blankPage(like)
     setPages((cur) => (lastSel >= 0 ? [...cur.slice(0, lastSel + 1), b, ...cur.slice(lastSel + 1)] : [...cur, b]))
+  }
+
+  /** Разрезаем листы: каждый превращается в несколько (части — как видно на экране). */
+  const cutPages = (cells: FRect[], scope: CutScope, around: PageRef) => {
+    const targets = new Set(scope === 'one' ? [around.key] : scope === 'selected' ? selected : pages.map((p) => p.key))
+    let made = 0
+    setPages((cur) =>
+      cur.flatMap((p) => {
+        if (!targets.has(p.key) || !p.src) return [p]
+        return cells.map((cell) => {
+          const piece = toBase(cell, p.rot) // часть в координатах листа без поворота
+          const crop = compose(p.crop ?? FULL, piece)
+          const edits = p.edits?.map((e): Edit => (e.kind === 'copy' ? { kind: 'copy', from: rebase(e.from, piece), to: rebase(e.to, piece) } : { kind: 'erase', rect: rebase(e.rect, piece) }))
+          made++
+          return { ...p, key: uid(), crop, edits, w: crop.w * p.fw, h: crop.h * p.fh }
+        })
+      }),
+    )
+    setSelected([])
+    setCutting(null)
+    setTimeout(() => toast(`Готово: получилось ${made} ${plural(made, 'лист', 'листа', 'листов')}. Отменить — «↶ Отменить»`), 0)
   }
 
   const clearAll = () => {
@@ -157,7 +184,7 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement
-      if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || split || preview) return
+      if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || split || preview || cutting || editing) return
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') (e.preventDefault(), undo())
       else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'a' || e.key.toLowerCase() === 'ф') && pages.length) (e.preventDefault(), setSelected(pages.map((p) => p.key)))
       else if ((e.key === 'Delete' || e.key === 'Backspace') && selected.length) (e.preventDefault(), remove(selected))
@@ -301,6 +328,14 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
               <button className="btn ghost small" onClick={() => duplicate(selected)}>
                 ⧉ Дублировать
               </button>
+              <button className="btn ghost small" onClick={() => setCutting(selPages.find((p) => p.src) ?? null)} disabled={!selPages.some((p) => p.src)}>
+                ✂ Разрезать
+              </button>
+              {n === 1 && selPages[0].src && (
+                <button className="btn ghost small" onClick={() => setEditing(selPages[0])}>
+                  ✏️ Править
+                </button>
+              )}
               <button className="btn ghost small" onClick={() => save(selPages, ' (выбранные листы)')}>
                 📤 Сохранить выбранные
               </button>
@@ -347,6 +382,8 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
               <div className="pg-actions" onClick={(e) => e.stopPropagation()}>
                 <button title="Посмотреть крупно" onClick={() => setPreview(p)}>🔍</button>
                 <button title="Повернуть" onClick={() => rotate([p.key], 90)}>⟳</button>
+                {p.src && <button title="Разрезать на части" onClick={() => setCutting(p)}>✂</button>}
+                {p.src && <button title="Править: дублировать или убрать элементы" onClick={() => setEditing(p)}>✏️</button>}
                 <button title="Дублировать" onClick={() => duplicate([p.key])}>⧉</button>
                 <button title="Удалить" onClick={() => remove([p.key])}>🗑</button>
               </div>
@@ -405,19 +442,37 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
         setBusy(null)
       }} />}
       {preview && <PreviewModal page={preview} close={() => setPreview(null)} />}
+      {cutting && (
+        <CutDialog
+          page={cutting}
+          selectedCount={selPages.filter((p) => p.src).length}
+          allCount={pages.filter((p) => p.src).length}
+          close={() => setCutting(null)}
+          apply={(cells, scope) => cutPages(cells, scope, cutting)}
+        />
+      )}
+      {editing && (
+        <EditDialog
+          page={editing}
+          close={() => setEditing(null)}
+          save={(edits) => {
+            setPages((cur) => cur.map((p) => (p.key === editing.key ? { ...p, edits } : p)))
+            setEditing(null)
+          }}
+        />
+      )}
     </div>
   )
 }
 
-/** Миниатюра листа: рисуем только когда лист появился на экране. */
+/** Миниатюра листа (с обрезкой, правками и поворотом). Рисуем, только когда лист появился на экране. */
 function PageThumb({ page, width = 150 }: { page: PageRef; width?: number }) {
   const ref = useRef<HTMLDivElement>(null)
   const [url, setUrl] = useState<string | null>(null)
   const [visible, setVisible] = useState(false)
   const turned = page.rot % 180 !== 0
-  const ratio = page.h / page.w
   const boxW = width
-  const boxH = turned ? width / ratio : width * ratio
+  const boxH = turned ? (width * page.w) / page.h : (width * page.h) / page.w
 
   useEffect(() => {
     const el = ref.current
@@ -430,26 +485,19 @@ function PageThumb({ page, width = 150 }: { page: PageRef; width?: number }) {
   useEffect(() => {
     if (!visible || !page.src) return
     let alive = true
-    renderPage(docId(page.src), page.index, width > 300 ? 1000 : 300)
-      .then((c) => alive && setUrl(c.toDataURL('image/jpeg', 0.85)))
+    const px = width * Math.min(2, devicePixelRatio || 1)
+    fullRender(page, turned ? (px * page.w) / page.h : px)
+      .then((full) => alive && setUrl(composeDisplay(full, page, px).toDataURL('image/jpeg', 0.85)))
       .catch(() => undefined)
     return () => {
       alive = false
     }
-  }, [visible, page.src, page.index, width])
+  }, [visible, page, width, turned])
 
-  // картинку поворачиваем, а рамку подгоняем под повёрнутый лист
-  const imgW = turned ? boxH : boxW
-  const imgH = turned ? boxW : boxH
   return (
     <div ref={ref} className="pg-img" style={{ width: boxW, height: boxH }}>
-      {!page.src ? (
-        <div className="blank-page">пустой лист</div>
-      ) : url ? (
-        <img src={url} alt="" draggable={false} style={{ width: imgW, height: imgH, transform: `translate(-50%, -50%) rotate(${page.rot}deg)` }} />
-      ) : (
-        <div className="sheet-loading" />
-      )}
+      {!page.src ? <div className="blank-page">пустой лист</div> : url ? <img src={url} alt="" draggable={false} /> : <div className="sheet-loading" />}
+      {page.edits?.length ? <span className="pg-badge">✏️</span> : null}
     </div>
   )
 }
