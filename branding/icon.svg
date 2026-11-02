@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5b8cff"/>
+      <stop offset="1" stop-color="#2e5bea"/>
+    </linearGradient>
+    <linearGradient id="st" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffd85c"/>
+      <stop offset="1" stop-color="#ff9f43"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity=".13" stroke-width="2"/>
+    </pattern>
+    <filter id="sh" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="14" stdDeviation="14" flood-color="#0b1f6b" flood-opacity=".35"/>
+    </filter>
+  </defs>
+  <!-- фон: тетрадь в клетку -->
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <rect width="512" height="512" rx="112" fill="url(#grid)"/>
+  <!-- наклейка -->
+  <g transform="rotate(-8 256 270)" filter="url(#sh)">
+    <rect x="96" y="150" width="320" height="230" rx="40" fill="url(#st)"/>
+    <rect x="124" y="176" width="264" height="178" rx="26" fill="#fffdf6"/>
+    <!-- строки с «именем» -->
+    <rect x="156" y="292" width="200" height="14" rx="7" fill="#2e5bea" opacity=".85"/>
+    <rect x="186" y="320" width="140" height="12" rx="6" fill="#ff6b6b" opacity=".8"/>
+    <text x="256" y="276" text-anchor="middle" font-family="Arial Black, Arial, sans-serif" font-weight="900" font-size="96" fill="#1b1f3b">Аб</text>
+    <!-- загнутый уголок -->
+    <path d="M416 330 L416 340 Q416 380 376 380 L366 380 Z" fill="#e8892f"/>
+  </g>
+  <!-- звёздочка -->
+  <path transform="translate(392 110) scale(1.15)" d="M0 -38 L11 -12 L38 -10 L17 8 L24 36 L0 21 L-24 36 L-17 8 L-38 -10 L-11 -12 Z" fill="#ffd85c" stroke="#fff" stroke-width="6" stroke-linejoin="round"/>
+</svg>
