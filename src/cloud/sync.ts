@@ -8,29 +8,15 @@ export type SyncStatus =
   | { kind: 'off' }
   | { kind: 'busy'; msg: string }
   | { kind: 'ok'; at: number }
-  | { kind: 'error'; msg: string; auth?: boolean; scope?: boolean }
+  | { kind: 'error'; msg: string; auth?: boolean }
 
 const META_KEY = 'nakl-sync-meta'
 const SUB: Record<FileKind, string> = { pdf: 'pdf', font: 'fonts', thumb: 'thumbs' }
 const fileName = (kind: FileKind, id: string) => (kind === 'pdf' ? id + '.pdf' : kind === 'thumb' ? id + '.jpg' : id + '.font')
 
-/** Папка на Диске, где лежит библиотека: «app:/» (папка приложения) или «disk:/…» (выбранная вами). */
-const ROOT_KEY = 'nakl-yadisk-root'
-export const DEFAULT_ROOT = 'app:/'
-export function loadRoot() {
-  return localStorage.getItem(ROOT_KEY) || DEFAULT_ROOT
-}
-export function saveRoot(root: string) {
-  localStorage.setItem(ROOT_KEY, root)
-  localStorage.removeItem(META_KEY) // в новой папке всё сверяем заново
-}
+/** Библиотека всегда лежит в папке приложения на Диске владельца: «Приложения › Наклейки». */
+const ROOT = 'app:/'
 const join = (root: string, name: string) => (root.endsWith('/') ? root + name : root + '/' + name)
-
-/** Как показать путь человеку: «Приложения/Наклейки» или «Школа/Наклейки». */
-export function prettyRoot(root: string) {
-  if (root === DEFAULT_ROOT) return 'Приложения › Наклейки'
-  return root.replace(/^disk:\/?/, '').split('/').filter(Boolean).join(' › ') || 'Корень Диска'
-}
 
 interface Meta {
   md5?: string // какая версия state.json на Диске уже учтена
@@ -64,7 +50,7 @@ export class CloudSync {
     this.setState = setState
     this.onStatus = onStatus
     this.disk = new YaDisk(token)
-    this.root = loadRoot()
+    this.root = ROOT
     this.dirs = { pdf: join(this.root, SUB.pdf), font: join(this.root, SUB.font), thumb: join(this.root, SUB.thumb) }
     this.statePath = join(this.root, 'state.json')
     try {
@@ -92,8 +78,9 @@ export class CloudSync {
       this.stop()
       this.onStatus({ kind: 'error', msg: e.message, auth: true })
     } else if (e instanceof ScopeError) {
+      clearToken()
       this.stop()
-      this.onStatus({ kind: 'error', msg: 'Нет доступа к выбранной папке. Войдите заново и разрешите доступ к Диску — или выберите папку приложения.', scope: true })
+      this.onStatus({ kind: 'error', msg: 'Нет доступа к общей библиотеке. Попросите у владельца новую ссылку.', auth: true })
     } else this.onStatus({ kind: 'error', msg: (e as Error).message || 'Ошибка синхронизации' })
   }
 
@@ -102,7 +89,6 @@ export class CloudSync {
     await this.run(async () => {
       try {
         this.onStatus({ kind: 'busy', msg: 'Подключаемся к Диску…' })
-        if (this.root !== DEFAULT_ROOT) await this.disk.mkdirs(this.root)
         for (const d of Object.values(this.dirs)) await this.disk.mkdir(d)
         for (const kind of Object.keys(this.dirs) as FileKind[]) {
           const names = await this.disk.list(this.dirs[kind])
@@ -228,10 +214,4 @@ export class CloudSync {
     return this.disk.info()
   }
 
-  folders(path: string) {
-    return this.disk.folders(path)
-  }
-  mkdir(path: string) {
-    return this.disk.mkdir(path)
-  }
 }

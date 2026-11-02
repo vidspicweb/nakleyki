@@ -3,10 +3,11 @@ import type { ReactNode } from 'react'
 import type { AppState } from './types'
 import { loadState, saveState } from './storage'
 import { registerUploadedFont } from './fonts'
-import { CloudSync, loadRoot, saveRoot } from './cloud/sync'
+import { CloudSync } from './cloud/sync'
 import type { SyncStatus } from './cloud/sync'
 import { YANDEX_CLIENT_ID } from './cloud/config'
-import { clearToken, loadToken, loginUrl, takeTokenFromUrl } from './cloud/yadisk'
+import { clearToken, loadRole, loadToken, loginUrl, shareLink, takeTokenFromUrl } from './cloud/yadisk'
+import type { Role, Token } from './cloud/yadisk'
 
 export interface CloudCtx {
   configured: boolean
@@ -16,10 +17,10 @@ export interface CloudCtx {
   login: (force?: boolean) => void
   logout: () => void
   syncNow: () => void
-  root: string
-  setRoot: (root: string) => void
-  folders: (path: string) => Promise<string[]>
-  mkdir: (path: string) => Promise<void>
+  role: Role
+  /** Ссылка, по которой сотрудник работает с библиотекой владельца без входа */
+  shareLink: () => string | null
+  expiresAt: number | null
 }
 
 interface Ctx {
@@ -51,8 +52,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<SyncStatus>({ kind: 'off' })
   const [connected, setConnected] = useState(false)
   const [user, setUser] = useState<CloudCtx['user']>(null)
-  const [root, setRootState] = useState(loadRoot)
-  const tokenRef = useRef<string | null>(null)
+  const [role, setRole] = useState<Role>(loadRole)
+  const tokenRef = useRef<Token | null>(null)
 
   const toast = useCallback((msg: string, kind: 'ok' | 'warn' = 'ok') => {
     const id = Date.now() + Math.random()
@@ -61,11 +62,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const startCloud = useCallback(
-    (token: string) => {
+    (token: Token) => {
       sync.current?.stop()
       tokenRef.current = token
+      const roleNow = loadRole()
+      setRole(roleNow)
       const s = new CloudSync(
-        token,
+        token.value,
         () => stateRef.current!,
         (next) => {
           fromCloud.current = next
@@ -75,9 +78,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
         (st) => {
           setStatus(st)
           if (st.kind === 'error' && st.auth) {
+            const member = roleNow === 'member'
+            clearToken()
             setConnected(false)
             setUser(null)
-            toast(st.msg, 'warn')
+            toast(member ? 'Ссылка на общую библиотеку больше не действует — попросите у владельца новую' : st.msg, 'warn')
           }
         },
       )
@@ -100,8 +105,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
       if (back.error) toast(back.error, 'warn')
       const token = back.token ?? loadToken()
       if (token && YANDEX_CLIENT_ID) {
-        if (back.token) toast('Яндекс Диск подключён — библиотека будет сохраняться туда')
-        startCloud(token.value)
+        if (back.role === 'owner') toast('Яндекс Диск подключён — библиотека будет храниться там')
+        if (back.role === 'member') toast('Готово! Вы подключены к общей библиотеке')
+        startCloud(token)
       }
     })
     return () => sync.current?.stop()
@@ -136,15 +142,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     login: (force = false) => {
       location.href = loginUrl(force)
     },
-    root,
-    setRoot: (r: string) => {
-      saveRoot(r)
-      setRootState(r)
-      if (tokenRef.current) startCloud(tokenRef.current)
-      toast('Теперь библиотека сохраняется в выбранную папку')
-    },
-    folders: (path: string) => sync.current?.folders(path) ?? Promise.resolve([]),
-    mkdir: (path: string) => sync.current?.mkdir(path) ?? Promise.resolve(),
+    role,
+    shareLink: () => (tokenRef.current && role === 'owner' ? shareLink(tokenRef.current) : null),
+    expiresAt: tokenRef.current?.expiresAt ?? null,
     logout: () => {
       sync.current?.stop()
       sync.current = null
@@ -152,7 +152,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setConnected(false)
       setUser(null)
       setStatus({ kind: 'off' })
-      toast('Вы вышли из Яндекс Диска. Данные на этом компьютере остались.')
+      toast('Общая библиотека отключена на этом компьютере. Данные здесь остались.')
     },
     syncNow: () => sync.current?.syncNow(),
   }

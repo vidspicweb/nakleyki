@@ -1,7 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
 import { useApp } from '../store'
-import { FolderPicker } from './FolderPicker'
-import { prettyRoot } from '../cloud/sync'
 
 const ago = (t: number) => {
   const s = Math.round((Date.now() - t) / 1000)
@@ -10,13 +8,16 @@ const ago = (t: number) => {
   return m < 60 ? `${m} мин назад` : new Date(t).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
 }
 
-/** Кнопка «Яндекс Диск» в шапке: вход, состояние синхронизации, выход. */
+/**
+ * Общая библиотека на Яндекс Диске владельца.
+ * Владелец входит один раз и делится ссылкой; сотрудники просто открывают ссылку.
+ */
 export function CloudButton() {
-  const { cloud } = useApp()
+  const { cloud, toast } = useApp()
   const [open, setOpen] = useState(false)
+  const [copied, setCopied] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
   const [, tick] = useState(0)
-  const [picker, setPicker] = useState(false)
 
   useEffect(() => {
     if (!open) return
@@ -26,8 +27,11 @@ export function CloudButton() {
     return () => (document.removeEventListener('mousedown', close), window.clearInterval(t))
   }, [open])
 
+  if (!cloud.configured) return null
+
   const st = cloud.status
-  let label: React.ReactNode = '☁ Яндекс Диск'
+  const owner = cloud.role === 'owner'
+  let label: React.ReactNode = '☁ Общая библиотека'
   let cls = 'cloud-btn'
   if (cloud.connected) {
     if (st.kind === 'busy') ((label = <><span className="mini-spin" /> Сохраняем…</>), (cls += ' busy'))
@@ -35,10 +39,24 @@ export function CloudButton() {
     else ((label = '☁ Сохранено'), (cls += ' ok'))
   }
 
+  const daysLeft = cloud.expiresAt ? Math.floor((cloud.expiresAt - Date.now()) / 864e5) : null
+
+  const copy = async () => {
+    const link = cloud.shareLink()
+    if (!link) return
+    try {
+      await navigator.clipboard.writeText(link)
+    } catch {
+      prompt('Скопируйте ссылку:', link)
+    }
+    setCopied(true)
+    toast('Ссылка скопирована — отправьте её сотруднику')
+    setTimeout(() => setCopied(false), 3000)
+  }
+
   return (
     <div className="cloud" ref={ref}>
-      {picker && <FolderPicker close={() => setPicker(false)} />}
-      <button className={cls} onClick={() => setOpen((o) => !o)} title="Хранение на Яндекс Диске">
+      <button className={cls} onClick={() => setOpen((o) => !o)} title="Общая библиотека на Яндекс Диске">
         {label}
       </button>
       {open && (
@@ -46,65 +64,79 @@ export function CloudButton() {
           <div className="cloud-head">
             <span className="ya-logo">Я</span>
             <div>
-              <div className="settings-title">Яндекс Диск</div>
-              <div className="muted tiny">{cloud.connected ? (cloud.user ? cloud.user.name : 'подключён') : 'не подключён'}</div>
+              <div className="settings-title">Общая библиотека</div>
+              <div className="muted tiny">
+                {!cloud.connected ? 'не подключена' : owner ? `Ваш Диск${cloud.user ? ' · ' + cloud.user.name : ''}` : 'на Диске владельца'}
+              </div>
             </div>
           </div>
 
-          {!cloud.configured ? (
-            <p className="muted tiny">Хранение на Яндекс Диске ещё не настроено для этого сайта. Пока всё сохраняется в браузере на этом компьютере.</p>
-          ) : !cloud.connected ? (
+          {!cloud.connected ? (
             <>
-              <ul className="cloud-list">
-                <li>Библиотека, ученики и настройки будут храниться на вашем Яндекс Диске</li>
-                <li>Войдите на любом компьютере — и всё будет на месте</li>
-                <li>Программа видит только свою папку «Приложения» на Диске, остальные ваши файлы ей недоступны</li>
-              </ul>
+              <p className="muted tiny">
+                <b>Вам дали ссылку?</b> Просто откройте её — больше ничего делать не нужно.
+              </p>
+              <div className="divider" />
+              <p className="muted tiny">
+                <b>Вы владелец библиотеки?</b> Подключите свой Яндекс Диск: шаблоны, ученики и настройки будут храниться в папке «Приложения › Наклейки», а сотрудникам вы отправите ссылку.
+              </p>
               <button className="btn primary full" onClick={() => cloud.login()}>
-                Войти через Яндекс
+                Подключить мой Яндекс Диск
               </button>
             </>
           ) : (
             <>
               <div className={'cloud-status ' + st.kind}>
                 {st.kind === 'busy' && st.msg}
-                {st.kind === 'ok' && <>✓ Всё сохранено на Диске · {ago(st.at)}</>}
+                {st.kind === 'ok' && <>✓ Всё сохранено · {ago(st.at)}</>}
                 {st.kind === 'error' && st.msg}
-                {st.kind === 'error' && st.scope && (
-                  <div className="row gap-s wrap" style={{ marginTop: 6 }}>
-                    <button className="btn primary small" onClick={() => cloud.login(true)}>Войти заново</button>
-                    <button className="btn ghost small" onClick={() => (setPicker(true), setOpen(false))}>Выбрать папку</button>
-                  </div>
-                )}
                 {st.kind === 'off' && 'Подключаемся…'}
               </div>
-              {cloud.user && cloud.user.totalMb > 0 && (
-                <div className="disk-space">
-                  <div className="bar">
-                    <div style={{ width: `${Math.min(100, (cloud.user.usedMb / cloud.user.totalMb) * 100)}%` }} />
+
+              {owner && (
+                <>
+                  {cloud.user && cloud.user.totalMb > 0 && (
+                    <div className="disk-space">
+                      <div className="bar">
+                        <div style={{ width: `${Math.min(100, (cloud.user.usedMb / cloud.user.totalMb) * 100)}%` }} />
+                      </div>
+                      <span className="muted tiny">
+                        На Диске занято {(cloud.user.usedMb / 1024).toFixed(1)} ГБ из {(cloud.user.totalMb / 1024).toFixed(0)} ГБ
+                      </span>
+                    </div>
+                  )}
+                  <div className="share-box">
+                    <b>🔗 Ссылка для сотрудника</b>
+                    <span className="muted tiny">Кто откроет её, сможет работать с этой библиотекой без входа. Доступ — только к папке «Приложения › Наклейки», остальные ваши файлы не видны.</span>
+                    <button className="btn primary full" onClick={copy}>
+                      {copied ? '✓ Скопировано' : 'Скопировать ссылку'}
+                    </button>
+                    <span className="muted tiny">
+                      Отправляйте только своим людям. Чтобы отключить все ссылки — отзовите доступ приложения «Наклейки» в настройках Яндекс ID и подключите Диск заново.
+                    </span>
                   </div>
-                  <span className="muted tiny">
-                    Занято {(cloud.user.usedMb / 1024).toFixed(1)} ГБ из {(cloud.user.totalMb / 1024).toFixed(0)} ГБ
-                  </span>
+                </>
+              )}
+              {daysLeft !== null && daysLeft < 30 && (
+                <div className="hint">
+                  Доступ к Диску закончится через {Math.max(0, daysLeft)} дн.{' '}
+                  {owner ? 'Подключите Диск заново и отправьте сотрудникам новую ссылку.' : 'Попросите у владельца новую ссылку.'}
                 </div>
               )}
-              <div className="folder-line">
-                <span className="muted tiny">Папка на Диске:</span>
-                <b>📁 {prettyRoot(cloud.root)}</b>
-                <button className="link-btn" onClick={() => (setPicker(true), setOpen(false))}>
-                  Изменить
-                </button>
-              </div>
-              <p className="muted tiny">Изменения сохраняются сами через пару секунд.</p>
+              <p className="muted tiny">Папка на Диске: Приложения › Наклейки. Изменения сохраняются сами через пару секунд.</p>
               <button className="btn soft full" onClick={cloud.syncNow} disabled={st.kind === 'busy'}>
                 ⟳ Синхронизировать сейчас
               </button>
-              <button className="btn ghost full" onClick={() => (cloud.logout(), setOpen(false))}>
-                Отключить Диск
+              <button
+                className="btn ghost full"
+                onClick={() => {
+                  if (confirm('Отключить общую библиотеку на этом компьютере? Шаблоны на Диске останутся.')) (cloud.logout(), setOpen(false))
+                }}
+              >
+                Отключить на этом компьютере
               </button>
             </>
           )}
-          {cloud.connected === false && cloud.configured && st.kind === 'error' && <div className="cloud-status error">{st.msg}</div>}
         </div>
       )}
     </div>

@@ -22,8 +22,40 @@ export function loginUrl(force = false) {
   return 'https://oauth.yandex.ru/authorize?' + p.toString()
 }
 
-/** После входа Яндекс возвращает нас на сайт с #access_token=… в адресе. */
-export function takeTokenFromUrl(): { token?: Token; error?: string } {
+/**
+ * Кто работает на этом компьютере:
+ *  owner  — владелец библиотеки, вошёл своим Яндексом;
+ *  member — сотрудник, открыл ссылку от владельца (ничего не вводит).
+ */
+export type Role = 'owner' | 'member'
+const ROLE_KEY = 'nakl-role'
+export const loadRole = (): Role => (localStorage.getItem(ROLE_KEY) === 'member' ? 'member' : 'owner')
+const saveRole = (r: Role) => localStorage.setItem(ROLE_KEY, r)
+
+const b64url = (s: string) => btoa(unescape(encodeURIComponent(s))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+const unb64url = (s: string) => decodeURIComponent(escape(atob(s.replace(/-/g, '+').replace(/_/g, '/'))))
+
+/** Ссылка для сотрудника: в ней ключ доступа к папке библиотеки на Диске владельца. */
+export function shareLink(t: Token) {
+  return location.origin + location.pathname + '#access=' + b64url(JSON.stringify({ t: t.value, e: t.expiresAt }))
+}
+
+/** После входа Яндекс возвращает нас на сайт с #access_token=… в адресе. Сотрудник приходит с #access=… */
+export function takeTokenFromUrl(): { token?: Token; error?: string; role?: Role } {
+  if (location.hash.startsWith('#access=')) {
+    const raw = location.hash.slice('#access='.length)
+    history.replaceState(null, '', location.pathname + location.search)
+    try {
+      const d = JSON.parse(unb64url(raw)) as { t: string; e: number }
+      if (!d.t || d.e < Date.now()) return { error: 'Эта ссылка уже не действует — попросите у владельца новую' }
+      const token = { value: d.t, expiresAt: d.e }
+      saveToken(token)
+      saveRole('member')
+      return { token, role: 'member' }
+    } catch {
+      return { error: 'Ссылка повреждена — скопируйте её целиком' }
+    }
+  }
   if (!location.hash.includes('access_token=') && !location.hash.includes('error=')) return {}
   const h = new URLSearchParams(location.hash.slice(1))
   history.replaceState(null, '', location.pathname + location.search)
@@ -32,7 +64,8 @@ export function takeTokenFromUrl(): { token?: Token; error?: string } {
   const value = h.get('access_token')!
   const token = { value, expiresAt: Date.now() + Number(h.get('expires_in') ?? 31536000) * 1000 }
   saveToken(token)
-  return { token }
+  saveRole('owner')
+  return { token, role: 'owner' }
 }
 
 export function loadToken(): Token | null {
@@ -45,7 +78,7 @@ export function loadToken(): Token | null {
   return null
 }
 export const saveToken = (t: Token) => localStorage.setItem(TOKEN_KEY, JSON.stringify(t))
-export const clearToken = () => localStorage.removeItem(TOKEN_KEY)
+export const clearToken = () => (localStorage.removeItem(TOKEN_KEY), localStorage.removeItem(ROLE_KEY))
 
 export class YaDisk {
   private token: string
@@ -75,28 +108,8 @@ export class YaDisk {
     return this.json<{ user?: { display_name?: string; login?: string }; total_space: number; used_space: number }>('GET', '/?fields=user,total_space,used_space')
   }
 
-  /** Создаём папку вместе со всеми родительскими. */
-  async mkdirs(path: string) {
-    const parts = path.replace(/^disk:\/?/, '').split('/').filter(Boolean)
-    let cur = 'disk:'
-    for (const p of parts) {
-      cur += '/' + p
-      await this.mkdir(cur)
-    }
-  }
-
-  /** Вложенные папки (для выбора папки). */
-  async folders(path: string): Promise<string[]> {
-    const res = await this.req('GET', `/resources?path=${enc(path)}&limit=1000&sort=name&fields=_embedded.items.name,_embedded.items.type`)
-    if (res.status === 403) throw new ScopeError('Нет доступа к папкам Диска')
-    if (!res.ok) throw new Error(await errText(res))
-    const data = await res.json()
-    return (data._embedded?.items ?? []).filter((i: { type: string }) => i.type === 'dir').map((i: { name: string }) => i.name)
-  }
-
   async mkdir(path: string) {
     const res = await this.req('PUT', '/resources?path=' + enc(path))
-    if (res.status === 403) throw new ScopeError('Нет прав создавать папки в этом месте Диска')
     if (!res.ok && res.status !== 409) throw new Error(await errText(res))
   }
 
