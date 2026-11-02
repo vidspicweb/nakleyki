@@ -7,6 +7,8 @@ const API = 'https://cloud-api.yandex.net/v1/disk'
 const TOKEN_KEY = 'nakl-yadisk-token'
 
 export class AuthError extends Error {}
+/** Токен есть, но прав не хватает (например, нет доступа ко всему Диску). */
+export class ScopeError extends Error {}
 
 export interface Token {
   value: string
@@ -15,8 +17,8 @@ export interface Token {
 
 const redirectUri = () => location.origin + location.pathname
 
-export function loginUrl() {
-  const p = new URLSearchParams({ response_type: 'token', client_id: YANDEX_CLIENT_ID, redirect_uri: redirectUri(), force_confirm: 'no' })
+export function loginUrl(force = false) {
+  const p = new URLSearchParams({ response_type: 'token', client_id: YANDEX_CLIENT_ID, redirect_uri: redirectUri(), force_confirm: force ? 'yes' : 'no' })
   return 'https://oauth.yandex.ru/authorize?' + p.toString()
 }
 
@@ -59,6 +61,7 @@ export class YaDisk {
       throw new Error('Нет связи с Яндекс Диском. Проверьте интернет.')
     }
     if (res.status === 401) throw new AuthError('Нужно войти в Яндекс Диск заново')
+    if (res.status === 403) throw new ScopeError('У программы нет доступа к этой папке Диска')
     return res
   }
 
@@ -72,8 +75,28 @@ export class YaDisk {
     return this.json<{ user?: { display_name?: string; login?: string }; total_space: number; used_space: number }>('GET', '/?fields=user,total_space,used_space')
   }
 
+  /** Создаём папку вместе со всеми родительскими. */
+  async mkdirs(path: string) {
+    const parts = path.replace(/^disk:\/?/, '').split('/').filter(Boolean)
+    let cur = 'disk:'
+    for (const p of parts) {
+      cur += '/' + p
+      await this.mkdir(cur)
+    }
+  }
+
+  /** Вложенные папки (для выбора папки). */
+  async folders(path: string): Promise<string[]> {
+    const res = await this.req('GET', `/resources?path=${enc(path)}&limit=1000&sort=name&fields=_embedded.items.name,_embedded.items.type`)
+    if (res.status === 403) throw new ScopeError('Нет доступа к папкам Диска')
+    if (!res.ok) throw new Error(await errText(res))
+    const data = await res.json()
+    return (data._embedded?.items ?? []).filter((i: { type: string }) => i.type === 'dir').map((i: { name: string }) => i.name)
+  }
+
   async mkdir(path: string) {
     const res = await this.req('PUT', '/resources?path=' + enc(path))
+    if (res.status === 403) throw new ScopeError('Нет прав создавать папки в этом месте Диска')
     if (!res.ok && res.status !== 409) throw new Error(await errText(res))
   }
 

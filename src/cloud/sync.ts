@@ -1,20 +1,36 @@
 import type { AppState } from '../types'
 import { loadFontLocal, loadPdfLocal, loadThumbLocal, setRemoteFetcher } from '../storage'
 import type { FileKind } from '../storage'
-import { AuthError, YaDisk, clearToken } from './yadisk'
+import { AuthError, ScopeError, YaDisk, clearToken } from './yadisk'
 import { mergeStates, sameData } from './merge'
 
 export type SyncStatus =
   | { kind: 'off' }
   | { kind: 'busy'; msg: string }
   | { kind: 'ok'; at: number }
-  | { kind: 'error'; msg: string; auth?: boolean }
+  | { kind: 'error'; msg: string; auth?: boolean; scope?: boolean }
 
 const META_KEY = 'nakl-sync-meta'
-const DIRS: Record<FileKind, string> = { pdf: 'app:/pdf', font: 'app:/fonts', thumb: 'app:/thumbs' }
+const SUB: Record<FileKind, string> = { pdf: 'pdf', font: 'fonts', thumb: 'thumbs' }
 const fileName = (kind: FileKind, id: string) => (kind === 'pdf' ? id + '.pdf' : kind === 'thumb' ? id + '.jpg' : id + '.font')
-const pathOf = (kind: FileKind, id: string) => DIRS[kind] + '/' + fileName(kind, id)
-const STATE_PATH = 'app:/state.json'
+
+/** Папка на Диске, где лежит библиотека: «app:/» (папка приложения) или «disk:/…» (выбранная вами). */
+const ROOT_KEY = 'nakl-yadisk-root'
+export const DEFAULT_ROOT = 'app:/'
+export function loadRoot() {
+  return localStorage.getItem(ROOT_KEY) || DEFAULT_ROOT
+}
+export function saveRoot(root: string) {
+  localStorage.setItem(ROOT_KEY, root)
+  localStorage.removeItem(META_KEY) // в новой папке всё сверяем заново
+}
+const join = (root: string, name: string) => (root.endsWith('/') ? root + name : root + '/' + name)
+
+/** Как показать путь человеку: «Приложения/Наклейки» или «Школа/Наклейки». */
+export function prettyRoot(root: string) {
+  if (root === DEFAULT_ROOT) return 'Приложения › Наклейки'
+  return root.replace(/^disk:\/?/, '').split('/').filter(Boolean).join(' › ') || 'Корень Диска'
+}
 
 interface Meta {
   md5?: string // какая версия state.json на Диске уже учтена
@@ -34,6 +50,10 @@ export class CloudSync {
   private remoteFiles: Record<FileKind, Set<string>> = { pdf: new Set(), font: new Set(), thumb: new Set() }
   private meta: Meta
   private stopped = false
+  private root: string
+  private dirs: Record<FileKind, string>
+  private statePath: string
+  private pathOf = (kind: FileKind, id: string) => this.dirs[kind] + '/' + fileName(kind, id)
 
   private getState: () => AppState
   private setState: (s: AppState) => void
@@ -44,6 +64,9 @@ export class CloudSync {
     this.setState = setState
     this.onStatus = onStatus
     this.disk = new YaDisk(token)
+    this.root = loadRoot()
+    this.dirs = { pdf: join(this.root, SUB.pdf), font: join(this.root, SUB.font), thumb: join(this.root, SUB.thumb) }
+    this.statePath = join(this.root, 'state.json')
     try {
       this.meta = JSON.parse(localStorage.getItem(META_KEY) ?? '{}')
     } catch {
@@ -68,17 +91,21 @@ export class CloudSync {
       clearToken()
       this.stop()
       this.onStatus({ kind: 'error', msg: e.message, auth: true })
+    } else if (e instanceof ScopeError) {
+      this.stop()
+      this.onStatus({ kind: 'error', msg: 'Нет доступа к выбранной папке. Войдите заново и разрешите доступ к Диску — или выберите папку приложения.', scope: true })
     } else this.onStatus({ kind: 'error', msg: (e as Error).message || 'Ошибка синхронизации' })
   }
 
   async start() {
-    setRemoteFetcher((kind, id) => (this.stopped ? Promise.resolve(null) : this.disk.download(pathOf(kind, id))))
+    setRemoteFetcher((kind, id) => (this.stopped ? Promise.resolve(null) : this.disk.download(this.pathOf(kind, id))))
     await this.run(async () => {
       try {
         this.onStatus({ kind: 'busy', msg: 'Подключаемся к Диску…' })
-        for (const d of Object.values(DIRS)) await this.disk.mkdir(d)
-        for (const kind of Object.keys(DIRS) as FileKind[]) {
-          const names = await this.disk.list(DIRS[kind])
+        if (this.root !== DEFAULT_ROOT) await this.disk.mkdirs(this.root)
+        for (const d of Object.values(this.dirs)) await this.disk.mkdir(d)
+        for (const kind of Object.keys(this.dirs) as FileKind[]) {
+          const names = await this.disk.list(this.dirs[kind])
           this.remoteFiles[kind] = new Set(names.map((n) => n.replace(/\.[^.]+$/, '')))
         }
         await this.pullInner(true)
@@ -124,7 +151,7 @@ export class CloudSync {
     if (this.stopped) return
     this.run(async () => {
       try {
-        const m = await this.disk.meta(STATE_PATH)
+        const m = await this.disk.meta(this.statePath)
         if (m?.md5 && m.md5 !== this.meta.md5) {
           await this.pullInner(false)
           await this.pushInner()
@@ -136,11 +163,11 @@ export class CloudSync {
   }
 
   private async pullInner(first: boolean) {
-    const m = await this.disk.meta(STATE_PATH)
+    const m = await this.disk.meta(this.statePath)
     if (!m) return // на Диске ещё ничего нет — просто отправим своё
     if (!first && m.md5 === this.meta.md5) return
     this.onStatus({ kind: 'busy', msg: 'Получаем изменения…' })
-    const blob = await this.disk.download(STATE_PATH)
+    const blob = await this.disk.download(this.statePath)
     if (!blob) return
     const remote = JSON.parse(await blob.text()) as AppState
     const local = this.getState()
@@ -166,25 +193,25 @@ export class CloudSync {
       this.onStatus({ kind: 'busy', msg: `Сохраняем на Диск: ${++done} из ${need.length}…` })
       const data = kind === 'pdf' ? await loadPdfLocal(id) : kind === 'font' ? await loadFontLocal(id) : await loadThumbLocal(id)
       if (!data) continue
-      await this.disk.upload(pathOf(kind, id), data)
+      await this.disk.upload(this.pathOf(kind, id), data)
       this.remoteFiles[kind].add(id)
     }
 
     // удалённое на этом или другом компьютере убираем и с Диска
     const deleted = state.deleted ?? {}
-    for (const kind of Object.keys(DIRS) as FileKind[])
+    for (const kind of Object.keys(this.dirs) as FileKind[])
       for (const id of [...this.remoteFiles[kind]])
         if (deleted[id]) {
-          await this.disk.remove(pathOf(kind, id))
+          await this.disk.remove(this.pathOf(kind, id))
           this.remoteFiles[kind].delete(id)
         }
 
-    const remoteMeta = await this.disk.meta(STATE_PATH)
+    const remoteMeta = await this.disk.meta(this.statePath)
     const body = new Blob([JSON.stringify(state)], { type: 'application/json' })
     // отправляем state.json, только если он отличается от того, что на Диске
     if (!remoteMeta || remoteMeta.md5 !== this.meta.md5 || this.dirtySincePush(state)) {
-      await this.disk.upload(STATE_PATH, body)
-      const m = await this.disk.meta(STATE_PATH)
+      await this.disk.upload(this.statePath, body)
+      const m = await this.disk.meta(this.statePath)
       this.meta.md5 = m?.md5
       this.lastPushed = state.updatedAt ?? 0
       this.saveMeta()
@@ -199,5 +226,12 @@ export class CloudSync {
 
   async info() {
     return this.disk.info()
+  }
+
+  folders(path: string) {
+    return this.disk.folders(path)
+  }
+  mkdir(path: string) {
+    return this.disk.mkdir(path)
   }
 }

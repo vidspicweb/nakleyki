@@ -3,7 +3,7 @@ import type { ReactNode } from 'react'
 import type { AppState } from './types'
 import { loadState, saveState } from './storage'
 import { registerUploadedFont } from './fonts'
-import { CloudSync } from './cloud/sync'
+import { CloudSync, loadRoot, saveRoot } from './cloud/sync'
 import type { SyncStatus } from './cloud/sync'
 import { YANDEX_CLIENT_ID } from './cloud/config'
 import { clearToken, loadToken, loginUrl, takeTokenFromUrl } from './cloud/yadisk'
@@ -13,9 +13,13 @@ export interface CloudCtx {
   connected: boolean
   status: SyncStatus
   user: { name: string; usedMb: number; totalMb: number } | null
-  login: () => void
+  login: (force?: boolean) => void
   logout: () => void
   syncNow: () => void
+  root: string
+  setRoot: (root: string) => void
+  folders: (path: string) => Promise<string[]>
+  mkdir: (path: string) => Promise<void>
 }
 
 interface Ctx {
@@ -47,6 +51,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<SyncStatus>({ kind: 'off' })
   const [connected, setConnected] = useState(false)
   const [user, setUser] = useState<CloudCtx['user']>(null)
+  const [root, setRootState] = useState(loadRoot)
+  const tokenRef = useRef<string | null>(null)
 
   const toast = useCallback((msg: string, kind: 'ok' | 'warn' = 'ok') => {
     const id = Date.now() + Math.random()
@@ -57,6 +63,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const startCloud = useCallback(
     (token: string) => {
       sync.current?.stop()
+      tokenRef.current = token
       const s = new CloudSync(
         token,
         () => stateRef.current!,
@@ -126,9 +133,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
     connected,
     status,
     user,
-    login: () => {
-      location.href = loginUrl()
+    login: (force = false) => {
+      location.href = loginUrl(force)
     },
+    root,
+    setRoot: (r: string) => {
+      saveRoot(r)
+      setRootState(r)
+      if (tokenRef.current) startCloud(tokenRef.current)
+      toast('Теперь библиотека сохраняется в выбранную папку')
+    },
+    folders: (path: string) => sync.current?.folders(path) ?? Promise.resolve([]),
+    mkdir: (path: string) => sync.current?.mkdir(path) ?? Promise.resolve(),
     logout: () => {
       sync.current?.stop()
       sync.current = null

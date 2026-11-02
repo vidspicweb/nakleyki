@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useApp } from '../store'
+import { FolderPicker } from './FolderPicker'
+import { prettyRoot } from '../cloud/sync'
 
 const ago = (t: number) => {
   const s = Math.round((Date.now() - t) / 1000)
@@ -14,6 +16,7 @@ export function CloudButton() {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
   const [, tick] = useState(0)
+  const [picker, setPicker] = useState(false)
 
   useEffect(() => {
     if (!open) return
@@ -34,6 +37,7 @@ export function CloudButton() {
 
   return (
     <div className="cloud" ref={ref}>
+      {picker && <FolderPicker close={() => setPicker(false)} />}
       <button className={cls} onClick={() => setOpen((o) => !o)} title="Хранение на Яндекс Диске">
         {label}
       </button>
@@ -56,7 +60,7 @@ export function CloudButton() {
                 <li>Войдите на любом компьютере — и всё будет на месте</li>
                 <li>Программа видит только свою папку «Приложения» на Диске, остальные ваши файлы ей недоступны</li>
               </ul>
-              <button className="btn primary full" onClick={cloud.login}>
+              <button className="btn primary full" onClick={() => cloud.login()}>
                 Войти через Яндекс
               </button>
             </>
@@ -66,6 +70,12 @@ export function CloudButton() {
                 {st.kind === 'busy' && st.msg}
                 {st.kind === 'ok' && <>✓ Всё сохранено на Диске · {ago(st.at)}</>}
                 {st.kind === 'error' && st.msg}
+                {st.kind === 'error' && st.scope && (
+                  <div className="row gap-s wrap" style={{ marginTop: 6 }}>
+                    <button className="btn primary small" onClick={() => cloud.login(true)}>Войти заново</button>
+                    <button className="btn ghost small" onClick={() => (setPicker(true), setOpen(false))}>Выбрать папку</button>
+                  </div>
+                )}
                 {st.kind === 'off' && 'Подключаемся…'}
               </div>
               {cloud.user && cloud.user.totalMb > 0 && (
@@ -78,7 +88,14 @@ export function CloudButton() {
                   </span>
                 </div>
               )}
-              <p className="muted tiny">Шаблоны лежат на Диске в папке «Приложения». Изменения сохраняются сами через пару секунд.</p>
+              <div className="folder-line">
+                <span className="muted tiny">Папка на Диске:</span>
+                <b>📁 {prettyRoot(cloud.root)}</b>
+                <button className="link-btn" onClick={() => (setPicker(true), setOpen(false))}>
+                  Изменить
+                </button>
+              </div>
+              <p className="muted tiny">Изменения сохраняются сами через пару секунд.</p>
               <button className="btn soft full" onClick={cloud.syncNow} disabled={st.kind === 'busy'}>
                 ⟳ Синхронизировать сейчас
               </button>
