@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { DEFAULT_GRID, detectGrid, gridCells } from '../pdf'
 import { plural } from '../util'
@@ -19,6 +20,7 @@ function useDisplayCanvas(page: PageRef, width: number, edits?: Edit[]) {
   const ref = useRef<HTMLCanvasElement>(null)
   const [full, setFull] = useState<HTMLCanvasElement | null>(null)
   useEffect(() => {
+    if (width <= 0) return
     let alive = true
     const turned = page.rot % 180 !== 0
     const pieceW = turned ? (width * page.w) / page.h : width
@@ -28,6 +30,7 @@ function useDisplayCanvas(page: PageRef, width: number, edits?: Edit[]) {
     }
   }, [page, width])
   useEffect(() => {
+    if (width <= 0) return
     let alive = true
     const dpr = Math.min(2, devicePixelRatio || 1)
     renderDisplay(page, width * dpr, edits ?? page.edits ?? []).then((c) => {
@@ -81,25 +84,147 @@ function placeGrid(page: PageRef, frag: FragmentRef, cols: number, rows: number)
   return out
 }
 
-/* ============================== РАЗРЕЗАТЬ ============================== */
+/* ============================== ОБЩЕЕ ОКНО РЕДАКТОРА ============================== */
+
+export type EditorMode = 'fragments' | 'copy' | 'cut'
+
+const MODES: { id: EditorMode; icon: string; title: string; sub: string }[] = [
+  { id: 'fragments', icon: '⬚', title: 'Вырезать фрагменты', sub: 'рамка → отдельный лист' },
+  { id: 'copy', icon: '⧉', title: 'Копировать и вставить', sub: 'дублировать, убрать' },
+  { id: 'cut', icon: '✂', title: 'Разрезать на части', sub: 'ровно, линиями' },
+]
+
+/** Свободное место под лист: измеряем, чтобы лист был как можно крупнее и ничего не обрезалось. */
+function useAreaSize() {
+  const ref = useRef<HTMLDivElement>(null)
+  const [size, setSize] = useState({ w: 0, h: 0 })
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const update = () => setSize({ w: el.clientWidth, h: el.clientHeight })
+    update()
+    const ro = new ResizeObserver(update)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  return [ref, size] as const
+}
+
+export interface EditorCommon {
+  page: PageRef
+  pageNo: number
+  pageCount: number
+  close: () => void
+  switchMode: (m: EditorMode) => void
+}
+
+/**
+ * Полноэкранный редактор листа: сверху — вкладки и главные кнопки, слева — крупный лист, справа — подсказки и настройки.
+ */
+function EditorShell({
+  mode,
+  common,
+  dirty,
+  areaRef,
+  primary,
+  side,
+  children,
+}: {
+  mode: EditorMode
+  common: EditorCommon
+  dirty: boolean
+  areaRef: React.RefObject<HTMLDivElement | null>
+  primary: ReactNode
+  side: ReactNode
+  children: ReactNode
+}) {
+  const leave = (fn: () => void) => {
+    if (!dirty || confirm('Изменения на этом листе ещё не применены. Выйти без них?')) fn()
+  }
+  useEffect(() => {
+    const prev = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    return () => {
+      document.body.style.overflow = prev
+    }
+  }, [])
+  return createPortal(
+    <div className="ed-full" role="dialog" aria-label="Редактор листа">
+      <header className="ed-head">
+        <button className="btn ghost" onClick={() => leave(common.close)}>
+          ← К листам
+        </button>
+        <div className="ed-title">
+          <b>Редактор листа</b>
+          <span>
+            Лист {common.pageNo} из {common.pageCount}
+          </span>
+        </div>
+        <nav className="ed-tabs" aria-label="Что сделать с листом">
+          {MODES.filter((m) => common.page.src || m.id === 'copy').map((m) => (
+            <button key={m.id} className={'ed-tab' + (m.id === mode ? ' on' : '')} onClick={() => m.id !== mode && leave(() => common.switchMode(m.id))}>
+              <span className="ed-tab-icon">{m.icon}</span>
+              <span className="ed-tab-text">
+                <b>{m.title}</b>
+                <small>{m.sub}</small>
+              </span>
+            </button>
+          ))}
+        </nav>
+        <div className="ed-actions">
+          <button className="btn ghost" onClick={() => leave(common.close)}>
+            Отмена
+          </button>
+          {primary}
+        </div>
+      </header>
+      <div className="ed-body">
+        <div className="ed-area" ref={areaRef}>
+          {children}
+        </div>
+        <aside className="ed-side">{side}</aside>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+/** Пронумерованные шаги в правой панели. */
+function Steps({ items }: { items: ReactNode[] }) {
+  return (
+    <ol className="ed-steps">
+      {items.map((t, i) => (
+        <li key={i}>
+          <span className="ed-step-n">{i + 1}</span>
+          <span>{t}</span>
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+const pct = (r: FRect) => ({ left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.w * 100}%`, height: `${r.h * 100}%` })
+const PAD = 48
+
+/* ============================== РАЗРЕЗАТЬ НА ЧАСТИ ============================== */
 
 export type CutScope = 'one' | 'selected' | 'all'
 
-export function CutDialog({
-  page,
+export function CutMode({
+  common,
   selectedCount,
   allCount,
-  close,
   apply,
 }: {
-  page: PageRef
+  common: EditorCommon
   selectedCount: number
   allCount: number
-  close: () => void
   apply: (cells: FRect[], scope: CutScope) => void
 }) {
-  const size = fitSize(page, Math.min(640, window.innerWidth - 420), window.innerHeight - 220)
-  const { ref, full } = useDisplayCanvas(page, size.w)
+  const { page } = common
+  const [areaRef, area] = useAreaSize()
+  const size = fitSize(page, Math.max(100, area.w - PAD), Math.max(100, area.h - PAD))
+  const { ref, full } = useDisplayCanvas(page, area.w ? size.w : 0)
   const [xs, setXs] = useState<number[]>([])
   const [ys, setYs] = useState<number[]>([0.5])
   const [scope, setScope] = useState<CutScope>(selectedCount > 1 ? 'selected' : 'one')
@@ -120,20 +245,17 @@ export function CutDialog({
     const g = detectGrid(c)
     if (JSON.stringify(g) !== JSON.stringify(DEFAULT_GRID) && g.cols * g.rows > 1) {
       const cs = gridCells(g)
-      const nx = [...new Set(cs.map((r) => r.x))].sort((a, b) => a - b).slice(1).map((x) => x - g.gapX / 2)
-      const ny = [...new Set(cs.map((r) => r.y))].sort((a, b) => a - b).slice(1).map((y) => y - g.gapY / 2)
-      setXs(nx)
-      setYs(ny)
+      setXs([...new Set(cs.map((r) => r.x))].sort((a, b) => a - b).slice(1).map((x) => x - g.gapX / 2))
+      setYs([...new Set(cs.map((r) => r.y))].sort((a, b) => a - b).slice(1).map((y) => y - g.gapY / 2))
       setNote(`Нашли ${g.cols * g.rows} ${plural(g.cols * g.rows, 'карточку', 'карточки', 'карточек')}`)
       return
     }
-    // карточки разные — ищем широкую белую полосу посередине
     const gap = whiteGap(c)
     if (gap.x !== null || gap.y !== null) {
       setXs(gap.x !== null ? [gap.x] : [])
       setYs(gap.y !== null ? [gap.y] : [])
       setNote('Нашли промежуток между карточками')
-    } else setNote('Не получилось найти карточки сами — выберите вариант слева или передвиньте линии мышкой')
+    } else setNote('Не получилось найти карточки сами — выберите готовый вариант или передвиньте линии мышкой')
   }
 
   const onMove = (e: React.PointerEvent) => {
@@ -165,140 +287,147 @@ export function CutDialog({
   )
 
   const count = scope === 'one' ? 1 : scope === 'selected' ? selectedCount : allCount
+  const presets: [number, number, string][] = [
+    [1, 2, 'Пополам: верх и низ'],
+    [2, 1, 'Пополам: лево и право'],
+    [2, 2, 'На 4 части'],
+    [1, 3, 'На 3 по высоте'],
+    [2, 3, 'На 6 частей'],
+    [2, 4, 'На 8 частей'],
+  ]
 
-  return createPortal(
-    <div className="modal-back" onClick={close}>
-      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
-        <h2>✂️ Разрезать лист на части</h2>
-        <div className="cut-layout">
-          <div className="cut-stage" ref={box} style={{ width: size.w, height: size.h }}>
-            <canvas ref={ref} style={{ width: size.w, height: size.h }} />
-            {cells.map((c, i) => (
-              <span key={i} className="cut-num" style={{ left: `${(c.x + c.w / 2) * 100}%`, top: `${(c.y + c.h / 2) * 100}%` }}>
-                {i + 1}
-              </span>
-            ))}
-            {xs.map((v, i) => line('x', v, i))}
-            {ys.map((v, i) => line('y', v, i))}
-          </div>
-          <div className="cut-side">
-            <div className="muted tiny">Как разрезать:</div>
-            <div className="cut-presets">
-              <button className="btn ghost small" onClick={() => grid(1, 2)}>▤ Пополам: верх / низ</button>
-              <button className="btn ghost small" onClick={() => grid(2, 1)}>◫ Пополам: лево / право</button>
-              <button className="btn ghost small" onClick={() => grid(2, 2)}>⊞ На 4 части</button>
-              <button className="btn ghost small" onClick={() => grid(1, 3)}>☰ На 3 по высоте</button>
-              <button className="btn ghost small" onClick={() => grid(2, 3)}>На 6 (2 × 3)</button>
-              <button className="btn ghost small" onClick={() => grid(2, 4)}>На 8 (2 × 4)</button>
+  return (
+    <EditorShell
+      mode="cut"
+      common={common}
+      dirty={false}
+      areaRef={areaRef}
+      primary={
+        <button className="btn primary" disabled={cells.length < 2} onClick={() => apply(cells, scope)}>
+          ✂ Разрезать на {cells.length} {plural(cells.length, 'часть', 'части', 'частей')}
+        </button>
+      }
+      side={
+        <>
+          <Steps
+            items={[
+              'Выберите, как разрезать — или нажмите «Найти карточки».',
+              'Если нужно, передвиньте красные линии мышкой.',
+              <>
+                Нажмите <b>«Разрезать»</b> вверху справа.
+              </>,
+            ]}
+          />
+          <div className="ed-group">
+            <div className="ed-label">Готовые варианты</div>
+            <div className="preset-grid">
+              {presets.map(([c, r, t]) => (
+                <button key={t} className="preset" onClick={() => grid(c, r)}>
+                  <span className="preset-pic" style={{ gridTemplateColumns: `repeat(${c}, 1fr)` }}>
+                    {Array.from({ length: c * r }, (_, i) => (
+                      <i key={i} />
+                    ))}
+                  </span>
+                  {t}
+                </button>
+              ))}
             </div>
-            <button className="btn soft small full" onClick={auto} disabled={!full}>
+            <button className="btn soft full" onClick={auto} disabled={!full}>
               🔍 Найти карточки автоматически
             </button>
             {note && <div className="hint">{note}</div>}
-            <div className="row gap-s wrap">
-              <button className="link-btn" onClick={() => setYs((a) => [...a, 0.5])}>+ линия поперёк</button>
-              <button className="link-btn" onClick={() => setXs((a) => [...a, 0.5])}>+ линия вдоль</button>
-              <button className="link-btn" onClick={() => (setXs([]), setYs([]))}>убрать все</button>
-            </div>
-            <div className="muted tiny">Линии с ножницами можно двигать мышкой. Двойной щелчок по линии — убрать её.</div>
-
-            <div className="divider" />
-            <div className="muted tiny">Какие листы резать:</div>
-            <label className="radio-row">
-              <input type="radio" checked={scope === 'one'} onChange={() => setScope('one')} /> Только этот лист
-            </label>
-            {selectedCount > 1 && (
-              <label className="radio-row">
-                <input type="radio" checked={scope === 'selected'} onChange={() => setScope('selected')} /> Выбранные листы ({selectedCount})
-              </label>
-            )}
-            {allCount > 1 && (
-              <label className="radio-row">
-                <input type="radio" checked={scope === 'all'} onChange={() => setScope('all')} /> Все листы документа ({allCount})
-              </label>
-            )}
-            <div className="cut-result">
-              Каждый лист → <b>{cells.length}</b> {plural(cells.length, 'часть', 'части', 'частей')}. Всего получится{' '}
-              <b>{cells.length * count}</b> {plural(cells.length * count, 'лист', 'листа', 'листов')}.
-            </div>
-            <div className="row end gap-s">
-              <button className="btn ghost" onClick={close}>
-                Отмена
-              </button>
-              <button className="btn primary" disabled={cells.length < 2} onClick={() => apply(cells, scope)}>
-                ✂️ Разрезать
-              </button>
-            </div>
           </div>
-        </div>
+          <div className="ed-group">
+            <div className="ed-label">Линии</div>
+            <div className="row gap-s wrap">
+              <button className="btn ghost small" onClick={() => setYs((a) => [...a, 0.5])}>
+                + Поперёк
+              </button>
+              <button className="btn ghost small" onClick={() => setXs((a) => [...a, 0.5])}>
+                + Вдоль
+              </button>
+              <button className="btn ghost small" onClick={() => (setXs([]), setYs([]))}>
+                Убрать все
+              </button>
+            </div>
+            <div className="muted tiny">Двойной щелчок по линии — убрать её.</div>
+          </div>
+          {(selectedCount > 1 || allCount > 1) && (
+            <div className="ed-group">
+              <div className="ed-label">Какие листы резать</div>
+              <label className="radio-row">
+                <input type="radio" checked={scope === 'one'} onChange={() => setScope('one')} /> Только этот лист
+              </label>
+              {selectedCount > 1 && (
+                <label className="radio-row">
+                  <input type="radio" checked={scope === 'selected'} onChange={() => setScope('selected')} /> Выбранные листы ({selectedCount})
+                </label>
+              )}
+              {allCount > 1 && (
+                <label className="radio-row">
+                  <input type="radio" checked={scope === 'all'} onChange={() => setScope('all')} /> Все листы документа ({allCount})
+                </label>
+              )}
+            </div>
+          )}
+          <div className="cut-result">
+            Получится <b>{cells.length * count}</b> {plural(cells.length * count, 'лист', 'листа', 'листов')}
+            {count > 1 ? ` (по ${cells.length} из каждого)` : ''}.
+          </div>
+        </>
+      }
+    >
+      <div className="cut-stage" ref={box} style={{ width: size.w, height: size.h }}>
+        <canvas ref={ref} style={{ width: size.w, height: size.h }} />
+        {cells.map((c, i) => (
+          <span key={i} className="cut-num" style={{ left: `${(c.x + c.w / 2) * 100}%`, top: `${(c.y + c.h / 2) * 100}%` }}>
+            {i + 1}
+          </span>
+        ))}
+        {xs.map((v, i) => line('x', v, i))}
+        {ys.map((v, i) => line('y', v, i))}
       </div>
-    </div>,
-    document.body,
+    </EditorShell>
   )
 }
 
-/** Самая широкая почти белая полоса в середине листа (между двумя разными карточками). */
-function whiteGap(c: HTMLCanvasElement): { x: number | null; y: number | null } {
-  const W = c.width
-  const H = c.height
-  const d = c.getContext('2d')!.getImageData(0, 0, W, H).data
-  const col = new Float32Array(W)
-  const row = new Float32Array(H)
-  for (let y = 0; y < H; y++)
-    for (let x = 0; x < W; x++) {
-      const i = (y * W + x) * 4
-      if (d[i] > 235 && d[i + 1] > 235 && d[i + 2] > 235) (col[x]++, row[y]++)
-    }
-  const best = (prof: Float32Array, len: number, total: number) => {
-    let bestLen = 0
-    let bestMid: number | null = null
-    let start = -1
-    for (let i = Math.floor(len * 0.2); i <= Math.ceil(len * 0.8); i++) {
-      const white = i < len && prof[i] / total > 0.985
-      if (white && start < 0) start = i
-      if (!white && start >= 0) {
-        if (i - start > bestLen) ((bestLen = i - start), (bestMid = (start + i) / 2 / len))
-        start = -1
-      }
-    }
-    return bestLen >= Math.max(2, len * 0.006) ? bestMid : null
-  }
-  return { x: best(col, W, H), y: best(row, H, W) }
-}
-
-/* ============================== ПРАВИТЬ ============================== */
+/* ============================== КОПИРОВАТЬ И ВСТАВИТЬ ============================== */
 
 type Drag =
   | { mode: 'new'; sx: number; sy: number }
   | { mode: 'move'; i: number; sx: number; sy: number; start: FRect }
   | { mode: 'resize'; i: number; sx: number; sy: number; start: FRect; keep: boolean }
 
-export function EditDialog({
-  page,
-  close,
+export function CopyMode({
+  common,
   save,
   clip,
+  clipUrl,
   onCopy,
   pasteOnOpen,
 }: {
-  page: PageRef
-  close: () => void
+  common: EditorCommon
   save: (edits: Edit[]) => void
   clip: FragmentRef | null
+  clipUrl: string | null
   onCopy: (f: FragmentRef) => void
   pasteOnOpen?: boolean
 }) {
-  const size = fitSize(page, Math.min(760, window.innerWidth - 400), window.innerHeight - 200)
+  const { page } = common
+  const [areaRef, area] = useAreaSize()
+  const size = fitSize(page, Math.max(100, area.w - PAD), Math.max(100, area.h - PAD))
   const [edits, setEdits] = useState<Edit[]>(() => {
     const base0 = page.edits ?? []
     if (pasteOnOpen && clip) return [...base0, { kind: 'place', frag: clip, to: toBase(placeCentered(page, clip), page.rot) }]
     return base0
   })
-  const { ref } = useDisplayCanvas(page, size.w, edits)
+  const { ref } = useDisplayCanvas(page, area.w ? size.w : 0, edits)
   const [sel, setSel] = useState<FRect | null>(null) // выделение (как видно на экране)
   const [active, setActive] = useState<number | null>(() => (pasteOnOpen && clip ? (page.edits ?? []).length : null))
+  const [copied, setCopied] = useState(false)
   const drag = useRef<Drag | null>(null)
   const box = useRef<HTMLDivElement>(null)
+  const dirty = JSON.stringify(edits) !== JSON.stringify(page.edits ?? [])
 
   const disp = (r: FRect) => toDisplay(r, page.rot)
   const base = (r: FRect) => toBase(r, page.rot)
@@ -315,6 +444,7 @@ export function EditDialog({
     drag.current = { mode: 'new', sx: p.x, sy: p.y }
     setSel({ x: p.x, y: p.y, w: 0, h: 0 })
     setActive(null)
+    setCopied(false)
     ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
   }
   const move = (e: React.PointerEvent) => {
@@ -369,7 +499,7 @@ export function EditDialog({
   const copySel = () => {
     if (!sel || !page.src) return
     onCopy(fragmentFrom(page, sel))
-    setSel(null)
+    setCopied(true)
   }
   const paste = () => {
     if (!clip) return
@@ -392,126 +522,131 @@ export function EditDialog({
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') (sel ? setSel(null) : close())
+      if (e.key === 'Escape' && sel) setSel(null)
       if ((e.key === 'Delete' || e.key === 'Backspace') && active !== null) removeEdit(active)
     }
     window.addEventListener('keydown', h)
     return () => window.removeEventListener('keydown', h)
   })
 
-  const pct = (r: FRect) => ({ left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.w * 100}%`, height: `${r.h * 100}%` })
   const act = active !== null ? edits[active] : null
+  const kindName = (e: Edit) => (e.kind === 'copy' ? '⧉ Копия' : e.kind === 'place' ? '📋 Вставка' : '⬜ Закрашено')
 
-  return createPortal(
-    <div className="modal-back" onClick={close}>
-      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
-        <h2>✏️ Править лист</h2>
-        <div className="cut-layout">
-          <div className="edit-stage" ref={box} style={{ width: size.w, height: size.h }} onPointerDown={down} onPointerMove={move} onPointerUp={up}>
-            <canvas ref={ref} style={{ width: size.w, height: size.h }} />
-            {act?.kind === 'copy' && <div className="edit-src" style={pct(disp(act.from))} />}
-            {edits.map((e, i) => (
-              <div
-                key={i}
-                className={'edit-box ' + (e.kind === 'place' ? 'copy' : e.kind) + (active === i ? ' on' : '')}
-                style={pct(disp(editRect(e)))}
-                onPointerDown={(ev) => startEditDrag(ev, i, 'move')}
-                title={e.kind === 'erase' ? 'Убранная область' : 'Копия — потяните, чтобы переставить'}
-              >
-                <span className="edit-handle" onPointerDown={(ev) => startEditDrag(ev, i, 'resize')} title="Потяните, чтобы изменить размер" />
-                {active === i && (
-                  <button className="edit-del" onPointerDown={(ev) => ev.stopPropagation()} onClick={() => removeEdit(i)} title="Удалить">
-                    ✕
-                  </button>
-                )}
-              </div>
-            ))}
-            {sel && sel.w > 0 && <div className="edit-sel" style={pct(sel)} />}
-          </div>
-          <div className="cut-side">
-            {!sel ? (
-              <div className="hint">
-                <b>Обведите мышкой</b> карточку, надпись или картинку на листе — появятся кнопки «Дублировать», «Копировать» и «Убрать».
-              </div>
-            ) : (
-              <div className="sel-box">
-                <b>Выделенная область</b>
-                <button className="btn primary full" onClick={duplicate} disabled={sel.w < 0.01}>
-                  ⧉ Дублировать
-                </button>
-                {page.src && (
-                  <button className="btn soft full" onClick={copySel} disabled={sel.w < 0.01}>
-                    📋 Копировать — вставить на другой лист
-                  </button>
-                )}
-                <button className="btn ghost full" onClick={erase} disabled={sel.w < 0.01}>
-                  ⬜ Убрать (закрасить белым)
-                </button>
-                <button className="link-btn" onClick={() => setSel(null)}>
-                  Снять выделение
-                </button>
-              </div>
-            )}
-            {clip && (
-              <div className="clip-box">
-                <b>📋 Фрагмент в буфере</b>
-                <button className="btn primary full" onClick={paste}>
-                  Вставить на этот лист
-                </button>
-                <div className="muted tiny">Разложить копиями по всему листу:</div>
-                <div className="grid-btns">
-                  {[
-                    [1, 2],
-                    [2, 2],
-                    [2, 3],
-                    [2, 4],
-                    [3, 3],
-                    [3, 4],
-                  ].map(([c, r]) => (
-                    <button key={c + 'x' + r} className="btn ghost small" onClick={() => pasteGrid(c, r)}>
-                      {c} × {r}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-            <ul className="muted tiny tips">
-              <li>Копию можно перетаскивать и менять размер за уголок — пропорции сохранятся.</li>
-              <li>Чтобы переместить элемент: дублируйте его, поставьте копию на место, а оригинал уберите.</li>
-              <li>Копия остаётся такой же чёткой, как оригинал: текст остаётся текстом.</li>
-            </ul>
-            {edits.length > 0 && (
-              <>
-                <div className="divider" />
-                <div className="muted tiny">Правки на листе: {edits.length}</div>
-                <div className="edit-list">
-                  {edits.map((e, i) => (
-                    <div key={i} className={'edit-row' + (active === i ? ' on' : '')} onClick={() => setActive(i)}>
-                      <span>{e.kind === 'copy' ? '⧉ Копия' : e.kind === 'place' ? '📋 Вставка' : '⬜ Убрано'}</span>
-                      <button className="icon-btn" onClick={(ev) => (ev.stopPropagation(), removeEdit(i))} title="Удалить правку">
-                        ✕
-                      </button>
-                    </div>
-                  ))}
-                </div>
-                <button className="link-btn" onClick={() => (setEdits([]), setActive(null))}>
-                  Убрать все правки
-                </button>
-              </>
-            )}
-            <div className="row end gap-s" style={{ marginTop: 'auto' }}>
-              <button className="btn ghost" onClick={close}>
-                Отмена
+  return (
+    <EditorShell
+      mode="copy"
+      common={common}
+      dirty={dirty}
+      areaRef={areaRef}
+      primary={
+        <button className="btn primary" onClick={() => save(edits)}>
+          ✓ Сохранить
+        </button>
+      }
+      side={
+        <>
+          {clip && (
+            <div className="ed-group clip-box">
+              <div className="ed-label">📋 Скопированный фрагмент</div>
+              <div className="clip-preview">{clipUrl ? <img src={clipUrl} alt="" /> : '📋'}</div>
+              <button className="btn primary full" onClick={paste}>
+                Вставить на этот лист
               </button>
-              <button className="btn primary" onClick={() => save(edits)}>
-                Готово
+              <div className="muted tiny">или заполнить весь лист копиями:</div>
+              <div className="grid-btns">
+                {[
+                  [1, 2],
+                  [2, 2],
+                  [2, 3],
+                  [2, 4],
+                  [3, 3],
+                  [3, 4],
+                ].map(([c, r]) => (
+                  <button key={c + 'x' + r} className="btn ghost small" onClick={() => pasteGrid(c, r)} title={`${c * r} копий`}>
+                    {c} × {r}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {sel && sel.w >= 0.01 ? (
+            <div className="ed-group sel-box">
+              <div className="ed-label">Что сделать с выделенным?</div>
+              <button className="btn primary full" onClick={duplicate}>
+                ⧉ Дублировать на этом листе
+              </button>
+              {page.src && (
+                <button className="btn soft full" onClick={copySel}>
+                  {copied ? '✓ Скопировано — откройте другой лист' : '📋 Копировать для других листов'}
+                </button>
+              )}
+              <button className="btn ghost full" onClick={erase}>
+                ⬜ Закрасить белым
+              </button>
+              <button className="link-btn" onClick={() => setSel(null)}>
+                Снять выделение
               </button>
             </div>
+          ) : (
+            <Steps
+              items={[
+                <>
+                  <b>Обведите мышкой</b> карточку, надпись или картинку на листе.
+                </>,
+                'Выберите: дублировать здесь, скопировать для других листов или закрасить.',
+                'Копию перетащите на нужное место. Размер — за синий уголок.',
+                <>
+                  Нажмите <b>«Сохранить»</b> вверху справа.
+                </>,
+              ]}
+            />
+          )}
+
+          {edits.length > 0 && (
+            <div className="ed-group">
+              <div className="ed-label">Изменения на листе ({edits.length})</div>
+              <div className="edit-list">
+                {edits.map((e, i) => (
+                  <div key={i} className={'edit-row' + (active === i ? ' on' : '')} onClick={() => setActive(i)}>
+                    <span>{kindName(e)}</span>
+                    <button className="icon-btn" onClick={(ev) => (ev.stopPropagation(), removeEdit(i))} title="Убрать">
+                      ✕
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button className="link-btn" onClick={() => (setEdits([]), setActive(null))}>
+                Убрать все изменения
+              </button>
+            </div>
+          )}
+          <div className="muted tiny">Копии остаются такими же чёткими, как оригинал. Чтобы переместить элемент: продублируйте его, поставьте на место, а оригинал закрасьте.</div>
+        </>
+      }
+    >
+      <div className="edit-stage" ref={box} style={{ width: size.w, height: size.h }} onPointerDown={down} onPointerMove={move} onPointerUp={up}>
+        <canvas ref={ref} style={{ width: size.w, height: size.h }} />
+        {act?.kind === 'copy' && <div className="edit-src" style={pct(disp(act.from))} />}
+        {edits.map((e, i) => (
+          <div
+            key={i}
+            className={'edit-box ' + (e.kind === 'erase' ? 'erase' : 'copy') + (active === i ? ' on' : '')}
+            style={pct(disp(editRect(e)))}
+            onPointerDown={(ev) => startEditDrag(ev, i, 'move')}
+            title={e.kind === 'erase' ? 'Закрашенная область' : 'Копия — потяните, чтобы переставить'}
+          >
+            <span className="edit-handle" onPointerDown={(ev) => startEditDrag(ev, i, 'resize')} title="Потяните, чтобы изменить размер" />
+            {active === i && (
+              <button className="edit-del" onPointerDown={(ev) => ev.stopPropagation()} onClick={() => removeEdit(i)} title="Убрать">
+                ✕
+              </button>
+            )}
           </div>
-        </div>
+        ))}
+        {sel && sel.w > 0 && <div className="edit-sel" style={pct(sel)} />}
       </div>
-    </div>,
-    document.body,
+    </EditorShell>
   )
 }
 
@@ -527,26 +662,25 @@ type FDrag =
  * Рисуем рамки вокруг нужных фрагментов — каждая рамка станет отдельным листом.
  * Рамки в долях от листа, как он виден на экране.
  */
-export function FragmentsDialog({
-  page,
-  close,
+export function FragmentsMode({
+  common,
   apply,
-  openLines,
   onCopy,
 }: {
-  page: PageRef
-  close: () => void
+  common: EditorCommon
   apply: (boxes: FRect[], keepOriginal: boolean) => void
-  openLines: () => void
   onCopy: (f: FragmentRef) => void
 }) {
-  const size = fitSize(page, Math.min(820, window.innerWidth - 400), window.innerHeight - 190)
-  const { ref, full } = useDisplayCanvas(page, size.w)
+  const { page } = common
+  const [areaRef, area] = useAreaSize()
+  const size = fitSize(page, Math.max(100, area.w - PAD), Math.max(100, area.h - PAD))
+  const { ref, full } = useDisplayCanvas(page, area.w ? size.w : 0)
   const [boxes, setBoxes] = useState<FRect[]>([])
   const [active, setActive] = useState<number | null>(null)
   const [drawing, setDrawing] = useState<FRect | null>(null)
   const [keep, setKeep] = useState(true)
   const [trim, setTrim] = useState(true)
+  const [copiedNo, setCopiedNo] = useState<number | null>(null)
   const drag = useRef<FDrag | null>(null)
   const box = useRef<HTMLDivElement>(null)
 
@@ -606,11 +740,11 @@ export function FragmentsDialog({
   const remove = (i: number) => {
     setBoxes((b) => b.filter((_, j) => j !== i))
     setActive(null)
+    setCopiedNo(null)
   }
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close()
       if ((e.key === 'Delete' || e.key === 'Backspace') && active !== null) remove(active)
     }
     window.addEventListener('keydown', h)
@@ -651,85 +785,124 @@ export function FragmentsDialog({
     })
   }
 
-  const pct = (r: FRect) => ({ left: `${r.x * 100}%`, top: `${r.y * 100}%`, width: `${r.w * 100}%`, height: `${r.h * 100}%` })
-
-  return createPortal(
-    <div className="modal-back" onClick={close}>
-      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
-        <h2>⬚ Вырезать фрагменты</h2>
-        <div className="cut-layout">
-          <div className="edit-stage frag-stage" ref={box} style={{ width: size.w, height: size.h }} onPointerDown={down} onPointerMove={move} onPointerUp={up}>
-            <canvas ref={ref} style={{ width: size.w, height: size.h }} />
-            {boxes.length > 0 && <div className="frag-dim" style={{ clipPath: dimPath(boxes) }} />}
-            {boxes.map((b, i) => (
-              <div key={i} className={'frag-box' + (active === i ? ' on' : '')} style={pct(b)} onPointerDown={(e) => startBoxDrag(e, i)}>
-                <span className="frag-num">{i + 1}</span>
-                {(['nw', 'ne', 'sw', 'se'] as Corner[]).map((c) => (
-                  <span key={c} className={'frag-h ' + c} onPointerDown={(e) => startBoxDrag(e, i, c)} />
+  return (
+    <EditorShell
+      mode="fragments"
+      common={common}
+      dirty={boxes.length > 0}
+      areaRef={areaRef}
+      primary={
+        <button className="btn primary" disabled={!boxes.length} onClick={() => apply(trimBoxes(boxes), keep)}>
+          ⬚ Вырезать{boxes.length ? ` ${boxes.length} ${plural(boxes.length, 'фрагмент', 'фрагмента', 'фрагментов')}` : ''}
+        </button>
+      }
+      side={
+        <>
+          <Steps
+            items={[
+              <>
+                <b>Нарисуйте мышкой рамку</b> вокруг нужной части листа.
+              </>,
+              'Нарисуйте ещё рамки, если нужно. Рамку можно двигать, а размер менять за уголки.',
+              <>
+                Нажмите <b>«Вырезать»</b> вверху справа — каждая рамка станет отдельным листом.
+              </>,
+            ]}
+          />
+          {boxes.length > 0 && (
+            <div className="ed-group">
+              <div className="ed-label">Рамки ({boxes.length})</div>
+              <div className="edit-list">
+                {boxes.map((_, i) => (
+                  <div key={i} className={'edit-row' + (active === i ? ' on' : '')} onClick={() => setActive(i)}>
+                    <span>Рамка {i + 1}</span>
+                    <span className="row gap-s">
+                      <button
+                        className="btn ghost small"
+                        onClick={(ev) => {
+                          ev.stopPropagation()
+                          onCopy(fragmentFrom(page, trimBoxes([boxes[i]])[0]))
+                          setCopiedNo(i)
+                        }}
+                        title="Скопировать, чтобы вставить на другой лист"
+                      >
+                        {copiedNo === i ? '✓ Скопировано' : '📋 Копировать'}
+                      </button>
+                      <button className="icon-btn" onClick={(ev) => (ev.stopPropagation(), remove(i))} title="Убрать рамку">
+                        ✕
+                      </button>
+                    </span>
+                  </div>
                 ))}
-                <button className="edit-del" onPointerDown={(e) => e.stopPropagation()} onClick={() => remove(i)} title="Убрать рамку">
-                  ✕
-                </button>
               </div>
+              <div className="muted tiny">«Копировать» — чтобы вставить этот фрагмент на другие листы (вкладка «Копировать и вставить» любого листа).</div>
+            </div>
+          )}
+          <div className="ed-group">
+            <div className="ed-label">Настройки</div>
+            <label className="radio-row">
+              <input type="checkbox" checked={trim} onChange={(e) => setTrim(e.target.checked)} /> Подрезать лишние белые поля
+            </label>
+            <div className="muted tiny" style={{ marginTop: 6 }}>
+              Исходный лист:
+            </div>
+            <label className="radio-row">
+              <input type="radio" checked={keep} onChange={() => setKeep(true)} /> оставить, фрагменты — после него
+            </label>
+            <label className="radio-row">
+              <input type="radio" checked={!keep} onChange={() => setKeep(false)} /> заменить фрагментами
+            </label>
+          </div>
+        </>
+      }
+    >
+      <div className="edit-stage frag-stage" ref={box} style={{ width: size.w, height: size.h }} onPointerDown={down} onPointerMove={move} onPointerUp={up}>
+        <canvas ref={ref} style={{ width: size.w, height: size.h }} />
+        {boxes.length > 0 && <div className="frag-dim" style={{ clipPath: dimPath(boxes) }} />}
+        {boxes.map((b, i) => (
+          <div key={i} className={'frag-box' + (active === i ? ' on' : '')} style={pct(b)} onPointerDown={(e) => startBoxDrag(e, i)}>
+            <span className="frag-num">{i + 1}</span>
+            {(['nw', 'ne', 'sw', 'se'] as Corner[]).map((c) => (
+              <span key={c} className={'frag-h ' + c} onPointerDown={(e) => startBoxDrag(e, i, c)} />
             ))}
-            {drawing && drawing.w > 0 && <div className="frag-box drawing" style={pct(drawing)} />}
-          </div>
-          <div className="cut-side">
-            <div className="hint">
-              <b>Нарисуйте мышкой рамку</b> вокруг нужного фрагмента. Можно нарисовать сколько угодно рамок — каждая станет отдельным листом.
-            </div>
-            <ul className="muted tiny tips">
-              <li>Рамку можно перетаскивать, а за уголки — менять размер.</li>
-              <li>✕ на рамке или клавиша Delete — убрать рамку.</li>
-            </ul>
-            <label className="radio-row">
-              <input type="checkbox" checked={trim} onChange={(e) => setTrim(e.target.checked)} /> Убрать лишние белые поля вокруг фрагмента
-            </label>
-            <div className="divider" />
-            <div className="muted tiny">Что сделать с исходным листом:</div>
-            <label className="radio-row">
-              <input type="radio" checked={keep} onChange={() => setKeep(true)} /> Оставить, фрагменты поставить после него
-            </label>
-            <label className="radio-row">
-              <input type="radio" checked={!keep} onChange={() => setKeep(false)} /> Заменить фрагментами
-            </label>
-            <div className="cut-result">
-              {boxes.length ? (
-                <>
-                  Получится <b>{boxes.length}</b> {plural(boxes.length, 'новый лист', 'новых листа', 'новых листов')}
-                </>
-              ) : (
-                'Пока нет ни одной рамки'
-              )}
-            </div>
-            {boxes.length > 0 && (
-              <div className="clip-box">
-                <b>📋 Нужно вставить фрагмент на другой лист?</b>
-                <span className="muted tiny">
-                  {boxes.length > 1 ? `Скопируется рамка № ${(active ?? boxes.length - 1) + 1} (выделенная). ` : ''}Потом наведите на любой лист и нажмите 📋 — или вставьте на новый пустой лист.
-                </span>
-                <button className="btn soft full" onClick={() => onCopy(fragmentFrom(page, trimBoxes([boxes[active ?? boxes.length - 1]])[0]))}>
-                  📋 Копировать фрагмент
-                </button>
-              </div>
-            )}
-            <button className="link-btn" onClick={openLines}>
-              Нужно разрезать весь лист ровно на части? Разрезать линиями →
+            <button className="edit-del" onPointerDown={(e) => e.stopPropagation()} onClick={() => remove(i)} title="Убрать рамку">
+              ✕
             </button>
-            <div className="row end gap-s" style={{ marginTop: 'auto' }}>
-              <button className="btn ghost" onClick={close}>
-                Отмена
-              </button>
-              <button className="btn primary" disabled={!boxes.length} onClick={() => apply(trimBoxes(boxes), keep)}>
-                ⬚ Вырезать
-              </button>
-            </div>
           </div>
-        </div>
+        ))}
+        {drawing && drawing.w > 0 && <div className="frag-box drawing" style={pct(drawing)} />}
       </div>
-    </div>,
-    document.body,
+    </EditorShell>
   )
+}
+
+/** Самая широкая почти белая полоса в середине листа (между двумя разными карточками). */
+function whiteGap(c: HTMLCanvasElement): { x: number | null; y: number | null } {
+  const W = c.width
+  const H = c.height
+  const d = c.getContext('2d')!.getImageData(0, 0, W, H).data
+  const col = new Float32Array(W)
+  const row = new Float32Array(H)
+  for (let y = 0; y < H; y++)
+    for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4
+      if (d[i] > 235 && d[i + 1] > 235 && d[i + 2] > 235) (col[x]++, row[y]++)
+    }
+  const best = (prof: Float32Array, len: number, total: number) => {
+    let bestLen = 0
+    let bestMid: number | null = null
+    let start = -1
+    for (let i = Math.floor(len * 0.2); i <= Math.ceil(len * 0.8); i++) {
+      const white = i < len && prof[i] / total > 0.985
+      if (white && start < 0) start = i
+      if (!white && start >= 0) {
+        if (i - start > bestLen) ((bestLen = i - start), (bestMid = (start + i) / 2 / len))
+        start = -1
+      }
+    }
+    return bestLen >= Math.max(2, len * 0.006) ? bestMid : null
+  }
+  return { x: best(col, W, H), y: best(row, H, W) }
 }
 
 /** Затемняем всё, кроме рамок (обводка-«дырки» через clip-path с правилом evenodd). */

@@ -5,8 +5,8 @@ import { importFile } from '../importer'
 import { plural } from '../util'
 import { blankPage, buildPdf, download, dropSource, fragSize, loadFile, parseRanges, renderDisplay, saveGroups } from '../pdftools/engine'
 import type { Edit, FragmentRef, PageRef, Source } from '../pdftools/engine'
-import { CutDialog, EditDialog, FragmentsDialog } from '../pdftools/dialogs'
-import type { CutScope } from '../pdftools/dialogs'
+import { CopyMode, CutMode, FragmentsMode } from '../pdftools/dialogs'
+import type { CutScope, EditorCommon, EditorMode } from '../pdftools/dialogs'
 import { FULL, compose, rebase, toBase } from '../pdftools/geom'
 import type { FRect } from '../pdftools/geom'
 import { uid } from '../util'
@@ -26,10 +26,15 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
   const [dropAt, setDropAt] = useState<number | null>(null)
   const [fileOver, setFileOver] = useState(false)
   const [split, setSplit] = useState(false)
-  const [preview, setPreview] = useState<PageRef | null>(null)
-  const [cutting, setCutting] = useState<PageRef | null>(null)
-  const [fragmenting, setFragmenting] = useState<PageRef | null>(null)
-  const [editing, setEditing] = useState<{ page: PageRef; paste?: boolean } | null>(null)
+  /** Открытый редактор листа: какой лист и какая вкладка */
+  const [editor, setEditor] = useState<{ key: string; mode: EditorMode; paste?: boolean } | null>(null)
+  const [thumbW, setThumbW] = useState(() => {
+    try {
+      return Number(localStorage.getItem('nakl-thumb')) || 150
+    } catch {
+      return 150
+    }
+  })
   const [clip, setClip] = useState<FragmentRef | null>(null)
   const [clipUrl, setClipUrl] = useState<string | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -117,7 +122,7 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
     renderDisplay(probe, fs.w >= fs.h ? 120 : (120 * fs.w) / fs.h)
       .then((c) => setClipUrl(c.toDataURL('image/png')))
       .catch(() => setClipUrl(null))
-    toast('Фрагмент скопирован. Наведите на любой лист и нажмите 📋 — или «На новый лист» внизу')
+    toast('Фрагмент скопирован — его можно вставить на любой лист')
   }
 
   /** Новый пустой лист сразу с вставленным фрагментом. */
@@ -127,14 +132,14 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
     const b = blankPage(fs.w > fs.h * 1.15 ? { ...blankPage(), w: 842, h: 595 } as PageRef : undefined)
     const lastSel = pagesRef.current.reduce((acc, p, i) => (sel.has(p.key) ? i : acc), -1)
     setPages((cur) => (lastSel >= 0 ? [...cur.slice(0, lastSel + 1), b, ...cur.slice(lastSel + 1)] : [...cur, b]))
-    setEditing({ page: b, paste: true })
+    setEditor({ key: b.key, mode: 'copy', paste: true })
   }
 
   const cutFragments = (boxes: FRect[], keep: boolean, around: PageRef) => {
     const pieces = boxes.map((b) => pieceOf(around, b))
     setPages((cur) => cur.flatMap((p) => (p.key === around.key ? (keep ? [p, ...pieces] : pieces) : [p])))
     setSelected(pieces.map((p) => p.key))
-    setFragmenting(null)
+    setEditor(null)
     toast(`Вырезано ${pieces.length} ${plural(pieces.length, 'фрагмент', 'фрагмента', 'фрагментов')} — они выделены синим. Отменить — «↶ Отменить»`)
   }
 
@@ -152,7 +157,7 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
       }),
     )
     setSelected([])
-    setCutting(null)
+    setEditor(null)
     setTimeout(() => toast(`Готово: получилось ${made} ${plural(made, 'лист', 'листа', 'листов')}. Отменить — «↶ Отменить»`), 0)
   }
 
@@ -224,7 +229,7 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const t = e.target as HTMLElement
-      if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || split || preview || cutting || editing || fragmenting) return
+      if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || split || editor) return
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') (e.preventDefault(), undo())
       else if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'a' || e.key.toLowerCase() === 'ф') && pages.length) (e.preventDefault(), setSelected(pages.map((p) => p.key)))
       else if ((e.key === 'Delete' || e.key === 'Backspace') && selected.length) (e.preventDefault(), remove(selected))
@@ -233,6 +238,23 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   })
+
+  // уведомления поднимаем над нижней панелью действий
+  useEffect(() => {
+    const on = selected.length > 0 && !editor
+    document.body.classList.toggle('has-dock', on)
+    return () => document.body.classList.remove('has-dock')
+  }, [selected.length, editor])
+
+  const openEditor = (p: PageRef, mode?: EditorMode, paste?: boolean) => setEditor({ key: p.key, mode: mode ?? (p.src ? 'fragments' : 'copy'), paste })
+  const setThumb = (w: number) => {
+    setThumbW(w)
+    try {
+      localStorage.setItem('nakl-thumb', String(w))
+    } catch {
+      /* не важно */
+    }
+  }
 
   // предупреждение при закрытии вкладки
   useEffect(() => {
@@ -304,6 +326,17 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
     )
 
   const n = selected.length
+  const edIndex = editor ? pages.findIndex((p) => p.key === editor.key) : -1
+  const edPage = edIndex >= 0 ? pages[edIndex] : null
+  const common: EditorCommon | null = edPage
+    ? {
+        page: edPage,
+        pageNo: edIndex + 1,
+        pageCount: pages.length,
+        close: () => setEditor(null),
+        switchMode: (m) => setEditor({ key: edPage.key, mode: m }),
+      }
+    : null
 
   return (
     <div
@@ -319,84 +352,73 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
       }}
     >
       {input}
-      <div className="page-head">
+
+      {/* шапка документа */}
+      <div className="doc-head">
         <div className="doc-title">
-          <span className="muted tiny">Название файла</span>
-          <input className="title-input big" value={name} placeholder="Документ" onChange={(e) => setName(e.target.value)} />
+          <label className="doc-name">
+            <span aria-hidden>📄</span>
+            <input value={name} placeholder="Документ" style={{ width: `${Math.min(40, Math.max(8, name.length + 2))}ch` }} onChange={(e) => setName(e.target.value)} title="Название файла — можно изменить" />
+            <span className="doc-pen" aria-hidden>
+              ✎
+            </span>
+          </label>
           <span className="muted tiny">
-            {pages.length} {plural(pages.length, 'лист', 'листа', 'листов')} · перетаскивайте листы, чтобы поменять порядок
+            {pages.length} {plural(pages.length, 'лист', 'листа', 'листов')}
           </span>
         </div>
-        <div className="row gap-s wrap">
+        <div className="doc-actions">
           <button className="btn ghost" onClick={() => setSplit(true)}>
-            ✂️ Разделить…
+            ✂️ Разделить на файлы
           </button>
-          <button className="btn primary big" onClick={() => save(pages)} disabled={!!busy}>
+          <button className="btn primary" onClick={() => save(pages)} disabled={!!busy}>
             ⬇ Скачать PDF
           </button>
         </div>
       </div>
 
+      {/* панель */}
       <div className="pdf-toolbar">
-        <div className="row gap-s wrap">
-          <button className="btn soft small" onClick={() => fileRef.current?.click()}>
-            ➕ Добавить файлы
-          </button>
-          <button className="btn ghost small" onClick={addBlank}>
-            ⬜ Пустой лист
-          </button>
-          <button className="btn ghost small" onClick={undo} disabled={!history.length} title="Ctrl+Z">
-            ↶ Отменить
-          </button>
-        </div>
-        <div className="row gap-s wrap sel-actions">
-          {n === 0 ? (
-            <>
-              <span className="muted tiny">Нажмите на лист, чтобы выбрать. Наведите на лист: ✂ — вырезать фрагменты, ✏️ — править.</span>
-              <button className="link-btn" onClick={() => setSelected(pages.map((p) => p.key))}>
-                Выбрать все
-              </button>
-            </>
-          ) : (
-            <>
-              <b className="sel-count">Выбрано: {n}</b>
-              <button className="btn ghost small" onClick={() => rotate(selected, -90)} title="Повернуть влево">
-                ⟲
-              </button>
-              <button className="btn ghost small" onClick={() => rotate(selected, 90)} title="Повернуть вправо">
-                ⟳
-              </button>
-              <button className="btn ghost small" onClick={() => duplicate(selected)}>
-                ⧉ Дублировать
-              </button>
-              <button className="btn ghost small" onClick={() => setCutting(selPages.find((p) => p.src) ?? null)} disabled={!selPages.some((p) => p.src)}>
-                ✂ Разрезать линиями
-              </button>
-              {n === 1 && selPages[0].src && (
-                <button className="btn ghost small" onClick={() => setFragmenting(selPages[0])}>
-                  ⬚ Вырезать фрагменты
-                </button>
-              )}
-              {n === 1 && selPages[0].src && (
-                <button className="btn ghost small" onClick={() => setEditing({ page: selPages[0] })}>
-                  ✏️ Править
-                </button>
-              )}
-              <button className="btn ghost small" onClick={() => save(selPages, ' (выбранные листы)')}>
-                📤 Сохранить выбранные
-              </button>
-              <button className="btn ghost small danger" onClick={() => remove(selected)}>
-                🗑 Удалить
-              </button>
-              <button className="link-btn" onClick={() => setSelected([])}>
-                Снять выбор
-              </button>
-            </>
-          )}
-        </div>
+        <button className="btn soft small" onClick={() => fileRef.current?.click()}>
+          ➕ Добавить файлы
+        </button>
+        <button className="btn ghost small" onClick={addBlank}>
+          ⬜ Пустой лист
+        </button>
+        <button className="btn ghost small" onClick={undo} disabled={!history.length} title="Ctrl+Z">
+          ↶ Отменить
+        </button>
+        <span className="grow" />
+        <label className="zoom" title="Размер листов на экране">
+          <span>🔍</span>
+          <input type="range" min={100} max={260} step={10} value={thumbW} onChange={(e) => setThumb(+e.target.value)} />
+        </label>
+        <button className="btn ghost small" onClick={() => setSelected(n === pages.length ? [] : pages.map((p) => p.key))}>
+          {n === pages.length ? 'Снять выбор' : 'Выбрать все'}
+        </button>
       </div>
 
-      <div className={'page-grid' + (fileOver ? ' file-over' : '')}>
+      {clip ? (
+        <div className="clip-bar">
+          {clipUrl ? <img src={clipUrl} alt="" /> : <span>📋</span>}
+          <div className="clip-text">
+            <b>Фрагмент скопирован</b>
+            <span className="muted tiny">Чтобы вставить: откройте лист → вкладка «Копировать и вставить». Или сразу:</span>
+          </div>
+          <button className="btn primary small" onClick={pasteToNewPage}>
+            ➕ Вставить на новый лист
+          </button>
+          <button className="icon-btn" title="Забыть скопированный фрагмент" onClick={() => (setClip(null), setClipUrl(null))}>
+            ✕
+          </button>
+        </div>
+      ) : (
+        <div className="pdf-help muted tiny">
+          <b>Щёлкните по листу</b>, чтобы выбрать его (внизу появятся действия). <b>«✏️ Открыть»</b> на листе — вырезать фрагменты, копировать и вставлять, разрезать. Порядок листов меняйте перетаскиванием.
+        </div>
+      )}
+
+      <div className={'page-grid' + (fileOver ? ' file-over' : '')} style={{ ['--thumb' as string]: thumbW + 'px' }}>
         {pages.map((p, i) => (
           <div
             key={p.key}
@@ -420,31 +442,34 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
               onDrop(dropAt ?? i)
             }}
             onClick={(e) => click(e, p.key)}
-            onDoubleClick={() => setPreview(p)}
+            onDoubleClick={() => openEditor(p)}
+            title="Щелчок — выбрать. Двойной щелчок — открыть"
           >
             <div className="pg-thumb">
-              <PageThumb page={p} />
-              <span className="pg-check">{sel.has(p.key) ? '✓' : ''}</span>
-              <div className="pg-actions" onClick={(e) => e.stopPropagation()}>
-                <button title="Посмотреть крупно" onClick={() => setPreview(p)}>🔍</button>
-                <button title="Повернуть" onClick={() => rotate([p.key], 90)}>⟳</button>
-                {p.src && <button title="Вырезать фрагменты" onClick={() => setFragmenting(p)}>✂</button>}
-                {p.src && <button title="Править: дублировать или убрать элементы" onClick={() => setEditing({ page: p })}>✏️</button>}
-                {clip && (
-                  <button title="Вставить скопированный фрагмент на этот лист" onClick={() => setEditing({ page: p, paste: true })}>
-                    📋
-                  </button>
-                )}
-                {!p.src && !clip && p.edits?.length ? <button title="Править" onClick={() => setEditing({ page: p })}>✏️</button> : null}
-                <button title="Дублировать" onClick={() => duplicate([p.key])}>⧉</button>
-                <button title="Удалить" onClick={() => remove([p.key])}>🗑</button>
-              </div>
+              <PageThumb page={p} width={thumbW} />
+              <span className="pg-check" aria-hidden>
+                {sel.has(p.key) ? '✓' : ''}
+              </span>
+              <button
+                className="pg-open"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  openEditor(p)
+                }}
+              >
+                ✏️ Открыть
+              </button>
             </div>
-            <span className="pg-num">{i + 1}</span>
+            <span className="pg-num">
+              {i + 1}
+              {p.crop ? <small> · фрагмент</small> : null}
+              {!p.src ? <small> · пустой</small> : null}
+            </span>
           </div>
         ))}
         <div
           className={'pg add-tile' + (dropAt === pages.length ? ' drop-before' : '')}
+          style={{ width: thumbW, height: thumbW * 1.41 }}
           onClick={() => fileRef.current?.click()}
           onDragOver={(e) => {
             if (!dragKey) return
@@ -466,16 +491,53 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
 
       <div className="pdf-footer">
         <button className="btn ghost small" onClick={toLibrary} disabled={!!busy}>
-          🏷 {n ? 'Выбранные листы' : 'Этот PDF'} — в библиотеку наклеек
+          🏷 Весь PDF — в библиотеку наклеек
         </button>
         <button className="link-btn" onClick={goLibrary}>
           Открыть библиотеку
         </button>
         <span className="grow" />
         <button className="btn ghost small danger" onClick={clearAll}>
-          Закрыть всё
+          Закрыть все листы
         </button>
       </div>
+
+      {/* действия с выбранными листами — внизу экрана */}
+      {n > 0 && !editor && (
+        <div className="sel-dock" role="toolbar" aria-label="Действия с выбранными листами">
+          <b className="sel-count">
+            Выбрано: {n} {plural(n, 'лист', 'листа', 'листов')}
+          </b>
+          {n === 1 && (
+            <button className="btn primary small" onClick={() => openEditor(selPages[0])}>
+              ✏️ Открыть
+            </button>
+          )}
+          <button className="btn ghost small" onClick={() => rotate(selected, 90)}>
+            ⟳ Повернуть
+          </button>
+          <button className="btn ghost small" onClick={() => duplicate(selected)}>
+            ⧉ Дублировать
+          </button>
+          {n > 1 && selPages.some((p) => p.src) && (
+            <button className="btn ghost small" onClick={() => openEditor(selPages.find((p) => p.src)!, 'cut')}>
+              ✂ Разрезать
+            </button>
+          )}
+          <button className="btn ghost small" onClick={() => save(selPages, ' (выбранные листы)')}>
+            📤 Сохранить отдельно
+          </button>
+          <button className="btn ghost small" onClick={toLibrary}>
+            🏷 В наклейки
+          </button>
+          <button className="btn ghost small danger" onClick={() => remove(selected)}>
+            🗑 Удалить
+          </button>
+          <button className="icon-btn" onClick={() => setSelected([])} title="Снять выбор (Esc)">
+            ✕
+          </button>
+        </div>
+      )}
 
       {busy && (
         <div className="busy-float">
@@ -493,58 +555,37 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
         }
         setBusy(null)
       }} />}
-      {preview && <PreviewModal page={preview} close={() => setPreview(null)} />}
-      {cutting && (
-        <CutDialog
-          page={cutting}
-          selectedCount={selPages.filter((p) => p.src).length}
-          allCount={pages.filter((p) => p.src).length}
-          close={() => setCutting(null)}
-          apply={(cells, scope) => cutPages(cells, scope, cutting)}
-        />
-      )}
-      {fragmenting && (
-        <FragmentsDialog
-          page={fragmenting}
-          close={() => setFragmenting(null)}
-          apply={(boxes, keep) => cutFragments(boxes, keep, fragmenting)}
-          onCopy={(f) => {
-            copyFragment(f)
-            setFragmenting(null)
-          }}
-          openLines={() => {
-            setCutting(fragmenting)
-            setFragmenting(null)
-          }}
-        />
-      )}
-      {editing && (
-        <EditDialog
-          page={editing.page}
-          clip={clip}
-          pasteOnOpen={editing.paste}
-          onCopy={copyFragment}
-          close={() => setEditing(null)}
-          save={(edits) => {
-            setPages((cur) => cur.map((p) => (p.key === editing.page.key ? { ...p, edits } : p)))
-            setEditing(null)
-          }}
-        />
-      )}
-      {clip && (
-        <div className="clip-chip">
-          {clipUrl ? <img src={clipUrl} alt="" /> : <span className="clip-icon">📋</span>}
-          <div className="clip-text">
-            <b>Фрагмент скопирован</b>
-            <span className="muted tiny">Наведите на лист и нажмите 📋</span>
-          </div>
-          <button className="btn primary small" onClick={pasteToNewPage}>
-            ➕ На новый лист
-          </button>
-          <button className="icon-btn" title="Очистить буфер" onClick={() => (setClip(null), setClipUrl(null))}>
-            ✕
-          </button>
-        </div>
+
+      {/* редактор листа — на весь экран */}
+      {editor && common && edPage && (
+        <>
+          {editor.mode === 'fragments' && edPage.src && (
+            <FragmentsMode key={edPage.key} common={common} apply={(boxes, keep) => cutFragments(boxes, keep, edPage)} onCopy={copyFragment} />
+          )}
+          {editor.mode === 'cut' && edPage.src && (
+            <CutMode
+              key={edPage.key}
+              common={common}
+              selectedCount={selPages.filter((p) => p.src).length}
+              allCount={pages.filter((p) => p.src).length}
+              apply={(cells, scope) => cutPages(cells, scope, edPage)}
+            />
+          )}
+          {(editor.mode === 'copy' || !edPage.src) && (
+            <CopyMode
+              key={edPage.key + (editor.paste ? ':paste' : '')}
+              common={common}
+              clip={clip}
+              clipUrl={clipUrl}
+              pasteOnOpen={editor.paste}
+              onCopy={copyFragment}
+              save={(edits) => {
+                setPages((cur) => cur.map((p) => (p.key === edPage.key ? { ...p, edits } : p)))
+                setEditor(null)
+              }}
+            />
+          )}
+        </>
       )}
     </div>
   )
@@ -584,26 +625,6 @@ function PageThumb({ page, width = 150 }: { page: PageRef; width?: number }) {
       {!page.src && !page.edits?.length ? <div className="blank-page">пустой лист</div> : url ? <img src={url} alt="" draggable={false} /> : <div className="sheet-loading" />}
       {page.edits?.length ? <span className="pg-badge">✏️</span> : null}
     </div>
-  )
-}
-
-function PreviewModal({ page, close }: { page: PageRef; close: () => void }) {
-  useEffect(() => {
-    const h = (e: KeyboardEvent) => e.key === 'Escape' && close()
-    window.addEventListener('keydown', h)
-    return () => window.removeEventListener('keydown', h)
-  }, [close])
-  const w = Math.min(760, window.innerWidth - 80, ((window.innerHeight - 120) * (page.rot % 180 ? page.h : page.w)) / (page.rot % 180 ? page.w : page.h))
-  return createPortal(
-    <div className="modal-back" onClick={close}>
-      <div className="preview-box" onClick={(e) => e.stopPropagation()}>
-        <PageThumb page={page} width={w} />
-        <button className="btn ghost small" onClick={close}>
-          Закрыть
-        </button>
-      </div>
-    </div>,
-    document.body,
   )
 }
 
