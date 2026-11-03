@@ -1,15 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useApp } from '../store'
-import type { Align, Grid, SchoolClass, Sheet, Student, TextLine } from '../types'
+import type { Align, Grid, Layout, SchoolClass, Sheet, Student, TextLine } from '../types'
 import { PLACEHOLDERS, SAMPLE_CLASS, SAMPLE_STUDENT, fillText } from '../names'
 import { cloneLayout, defaultLayout, newLine } from '../render'
-import { StickerCanvas } from '../components/StickerCanvas'
+import { resolveSheet, sameLayout } from '../layouts'
+import { AlignGlyph, StickerCanvas } from '../components/StickerCanvas'
 import { SheetPreview } from '../components/SheetPreview'
 import { FontPicker } from '../components/FontPicker'
 import { detectGrid, renderPage } from '../pdf'
 import { clamp, plural } from '../util'
 import { Thumb } from '../components/Thumb'
-import { SheetPicker } from '../components/SheetPicker'
 import { FilterBar } from '../components/Tags'
 import { filterSheets } from '../tags'
 import type { SheetFilter } from '../tags'
@@ -18,11 +18,13 @@ const COLORS = ['#1b1f3b', '#000000', '#1d4ed8', '#7c3aed', '#be123c', '#047857'
 
 export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemplates: () => void }) {
   const { state, update, toast } = useApp()
-  const sheet = state.sheets.find((s) => s.id === state.activeSheetId) ?? state.sheets[0]
+  const rawSheet = state.sheets.find((s) => s.id === state.activeSheetId) ?? state.sheets[0]
+  // шаблон вместе с раскладкой, по которой он печатается (общей или своей)
+  const sheet = useMemo(() => (rawSheet ? resolveSheet(state, rawSheet) : undefined), [rawSheet, state.commonLayout])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [cellIndex, setCellIndex] = useState(0)
   const [studentIdx, setStudentIdx] = useState(0)
-  const [showApply, setShowApply] = useState(false)
+  const [focusText, setFocusText] = useState(0)
   const [showGrid, setShowGrid] = useState(false)
   const [stripFilter, setStripFilter] = useState<SheetFilter>({ q: '', tags: [] })
   const stripSheets = useMemo(() => {
@@ -73,16 +75,67 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
       </div>
     )
 
+  const own = !!rawSheet?.ownLayout || !state.commonLayout
+  const linkedCount = state.sheets.filter((s) => !s.ownLayout).length
+
+  /** Свойства самого шаблона (сетка, предмет). */
   const patchSheet = (fn: (s: Sheet) => void) =>
     update((d) => {
+      fn(d.sheets.find((x) => x.id === sheet.id)!)
+    })
+  /** Раскладка строк: общая для всех шаблонов или своя у этого шаблона. */
+  const patchLayout = (fn: (l: Layout) => void) =>
+    update((d) => {
       const s = d.sheets.find((x) => x.id === sheet.id)!
-      fn(s)
-      d.lastLayout = s.layout
+      if (s.ownLayout || !d.commonLayout) fn(s.layout)
+      else fn(d.commonLayout)
     })
   const patchLine = (id: string, p: Partial<TextLine>) =>
-    patchSheet((s) => {
-      Object.assign(s.layout.lines.find((l) => l.id === id)!, p)
+    patchLayout((l) => {
+      const line = l.lines.find((x) => x.id === id)
+      if (line) Object.assign(line, p)
     })
+  const duplicateLine = (id: string) => {
+    const src = sheet.layout.lines.find((l) => l.id === id)
+    if (!src) return
+    const { id: _id, ...rest } = src
+    const copy = newLine({ ...rest, y: clamp(src.y + 0.08, 0.05, 1) })
+    patchLayout((l) => void l.lines.splice(l.lines.findIndex((x) => x.id === id) + 1, 0, copy))
+    setSelectedId(copy.id)
+  }
+  const removeLine = (id: string) => {
+    if (!confirm('Удалить эту строку?')) return
+    patchLayout((l) => void (l.lines = l.lines.filter((x) => x.id !== id)))
+    setSelectedId(null)
+  }
+
+  const setOwn = (want: boolean) => {
+    if (want === own) return
+    if (want) {
+      update((d) => {
+        const s = d.sheets.find((x) => x.id === sheet.id)!
+        s.layout = cloneLayout(d.commonLayout ?? s.layout)
+        s.ownLayout = true
+      })
+      toast('Теперь у этого шаблона своя раскладка — остальные не изменятся')
+    } else {
+      if (rawSheet && state.commonLayout && !sameLayout(rawSheet.layout, state.commonLayout) && !confirm('Настройки строк этого шаблона заменятся общими. Продолжить?')) return
+      update((d) => void (d.sheets.find((x) => x.id === sheet.id)!.ownLayout = false))
+      toast('Шаблон снова использует общую раскладку')
+    }
+    setSelectedId(null)
+  }
+  const makeCommon = () => {
+    if (!confirm('Сделать раскладку этого шаблона общей? Все шаблоны с общей раскладкой будут выглядеть так же.')) return
+    update((d) => {
+      const s = d.sheets.find((x) => x.id === sheet.id)!
+      d.commonLayout = cloneLayout(s.layout)
+      s.ownLayout = false
+    })
+    toast('Готово: эта раскладка теперь общая')
+  }
+
+  const usesSubject = sheet.layout.lines.some((l) => l.enabled && /\{\s*предмет\s*\}/i.test(l.text))
 
   const selected = sheet.layout.lines.find((l) => l.id === selectedId) ?? null
 
@@ -95,6 +148,12 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
     <div className="page editor-page" onKeyDown={(e) => {
       const tag = (e.target as HTMLElement).tagName
       if (!selected || tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+      if (e.key === '+' || e.key === '=' || e.key === '-' || e.key === '_') {
+        e.preventDefault()
+        patchLine(selected.id, { size: clamp(+(selected.size + (e.key === '-' || e.key === '_' ? -0.5 : 0.5)).toFixed(1), 4, 72) })
+        return
+      }
+      if (e.key === 'Delete') return removeLine(selected.id)
       const step = e.shiftKey ? 0.02 : 0.003
       const map: Record<string, [number, number]> = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }
       if (map[e.key]) {
@@ -105,7 +164,9 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
       <div className="page-head">
         <div>
           <h1>Настройка наклейки</h1>
-          <p className="lead">Настройте одну наклейку — все остальные на листе и для всех учеников выровняются так же. Строки можно <b>перетаскивать мышкой</b>.</p>
+          <p className="lead">
+            Настройте одну наклейку — все остальные выровняются так же. Нажмите на строку прямо на наклейке: её можно <b>перетащить</b>, а над ней появятся кнопки размера и выравнивания.
+          </p>
         </div>
         <button className="btn primary big" onClick={goNext}>
           Дальше: печать →
@@ -134,6 +195,41 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
       <div className="editor">
         <section className="editor-main">
           <div className="card stage-card">
+            <div className="layout-mode">
+              <div className="seg">
+                <button className={!own ? 'on' : ''} onClick={() => setOwn(false)}>
+                  🔗 Общая раскладка
+                </button>
+                <button className={own ? 'on' : ''} onClick={() => setOwn(true)}>
+                  ✏️ Своя для этого шаблона
+                </button>
+              </div>
+              <span className="muted tiny">
+                {!own
+                  ? `Изменения сразу применяются ко всем шаблонам с общей раскладкой (${linkedCount} ${plural(linkedCount, 'шаблон', 'шаблона', 'шаблонов')}).`
+                  : 'Изменения касаются только этого шаблона.'}
+              </span>
+              {own && state.sheets.length > 1 && (
+                <button className="link-btn" onClick={makeCommon}>
+                  Сделать эту раскладку общей
+                </button>
+              )}
+            </div>
+
+            <div className="subject-row">
+              <label className="inline-field">
+                <span>📚 Предмет на этом шаблоне:</span>
+                <input value={sheet.subject} placeholder="например: математике" onChange={(e) => patchSheet((s) => void (s.subject = e.target.value))} />
+              </label>
+              <span className={'muted tiny' + (usesSubject && !sheet.subject.trim() ? ' warn-text' : '')}>
+                {usesSubject
+                  ? sheet.subject.trim()
+                    ? `Подставится вместо {предмет}: «для работ по ${sheet.subject.trim()}». У каждого шаблона свой предмет.`
+                    : '⚠ Предмет не указан — в строке с {предмет} будет пусто. Впишите, например: «математике».'
+                  : 'Предмет печатается, только если включена строка с {предмет} (например «для работ по {предмет}»). У каждого шаблона свой предмет.'}
+              </span>
+            </div>
+
             <div className="stage-toolbar">
               <label className="inline-field">
                 <span>Пример:</span>
@@ -163,9 +259,18 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
                 selectedId={selectedId}
                 onSelect={setSelectedId}
                 onMove={(id, x, y) => patchLine(id, { x, y })}
+                onPatch={patchLine}
+                onEditText={(id) => {
+                  setSelectedId(id)
+                  setFocusText((n) => n + 1)
+                }}
+                onDuplicate={duplicateLine}
+                onRemove={removeLine}
               />
             </div>
-            <div className="muted tiny center">Совет: выделите строку и двигайте стрелками на клавиатуре — для точной подгонки. С Shift — быстрее.</div>
+            <div className="muted tiny center">
+              Нажмите на строку — над ней появятся кнопки. Тяните строку мышкой, а за боковые кружки — меняйте размер. Точно: стрелки на клавиатуре, размер: + и −.
+            </div>
           </div>
 
           <div className="card">
@@ -194,14 +299,11 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
                   <p>Нажмите на любую наклейку на листе, чтобы настраивать на ней (красная рамка).</p>
                   <p className="muted">Текст ставится на одно и то же место на каждой наклейке.</p>
                   <div className="divider" />
-                  <button className="btn soft full" onClick={() => setShowApply(true)} disabled={state.sheets.length < 2}>
-                    📋 Применить эту настройку к другим шаблонам
-                  </button>
                   <button
                     className="btn ghost full"
                     onClick={() => {
                       if (!confirm('Вернуть строки как было изначально?')) return
-                      patchSheet((s) => void (s.layout = defaultLayout()))
+                      patchLayout((l) => void (l.lines = defaultLayout().lines))
                       setSelectedId(null)
                     }}
                   >
@@ -221,7 +323,7 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
                 className="btn soft small"
                 onClick={() => {
                   const l = newLine({ font: selected?.font ?? sheet.layout.lines.find((x) => x.enabled)?.font ?? 'Nunito', y: 0.5 })
-                  patchSheet((s) => void s.layout.lines.push(l))
+                  patchLayout((L) => void L.lines.push(l))
                   setSelectedId(l.id)
                 }}
               >
@@ -244,10 +346,10 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
                     </span>
                   </button>
                   <span className="updown">
-                    <button disabled={i === 0} onClick={() => patchSheet((s) => void s.layout.lines.splice(i - 1, 0, ...s.layout.lines.splice(i, 1)))} title="Выше в списке">
+                    <button disabled={i === 0} onClick={() => patchLayout((L) => void L.lines.splice(i - 1, 0, ...L.lines.splice(i, 1)))} title="Выше в списке">
                       ▲
                     </button>
-                    <button disabled={i === sheet.layout.lines.length - 1} onClick={() => patchSheet((s) => void s.layout.lines.splice(i + 1, 0, ...s.layout.lines.splice(i, 1)))} title="Ниже в списке">
+                    <button disabled={i === sheet.layout.lines.length - 1} onClick={() => patchLayout((L) => void L.lines.splice(i + 1, 0, ...L.lines.splice(i, 1)))} title="Ниже в списке">
                       ▼
                     </button>
                   </span>
@@ -263,12 +365,11 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
               sample={fillText(selected.text, student, cls, sheet) || 'Божко Александр'}
               patch={(p) => patchLine(selected.id, p)}
               nudge={nudge}
-              remove={() => {
-                patchSheet((s) => void (s.layout.lines = s.layout.lines.filter((l) => l.id !== selected.id)))
-                setSelectedId(null)
-              }}
+              remove={() => removeLine(selected.id)}
+              focusSignal={focusText}
+              subject={sheet.subject}
               fontForAll={() => {
-                patchSheet((s) => s.layout.lines.forEach((l) => (l.font = selected.font)))
+                patchLayout((L) => L.lines.forEach((l) => (l.font = selected.font)))
                 toast('Шрифт поставлен всем строкам')
               }}
             />
@@ -282,20 +383,30 @@ export function EditorPage({ goNext, goTemplates }: { goNext: () => void; goTemp
         </aside>
       </div>
 
-      {showApply && <ApplyDialog sheet={sheet} close={() => setShowApply(false)} />}
     </div>
   )
 }
 
-function LineSettings({ line, sample, patch, nudge, remove, fontForAll }: {
+function LineSettings({ line, sample, patch, nudge, remove, fontForAll, focusSignal, subject }: {
   line: TextLine
   sample: string
   patch: (p: Partial<TextLine>) => void
   nudge: (dx: number, dy: number) => void
   remove: () => void
   fontForAll: () => void
+  focusSignal: number
+  subject: string
 }) {
   const textRef = useRef<HTMLInputElement>(null)
+  const boxRef = useRef<HTMLDivElement>(null)
+  // двойной щелчок по строке на наклейке — сразу к её тексту
+  useEffect(() => {
+    if (!focusSignal) return
+    boxRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    textRef.current?.focus()
+    textRef.current?.select()
+  }, [focusSignal])
+  const hasSubject = /\{\s*предмет\s*\}/i.test(line.text)
   const insert = (key: string) => {
     const el = textRef.current
     const start = el?.selectionStart ?? line.text.length
@@ -311,13 +422,26 @@ function LineSettings({ line, sample, patch, nudge, remove, fontForAll }: {
     })
   }
   return (
-    <div className="card line-settings">
+    <div className="card line-settings" ref={boxRef}>
       <h2>Настройки строки</h2>
 
       <label className="field">
         <span>Текст</span>
         <input ref={textRef} value={line.text} onChange={(e) => patch({ text: e.target.value })} />
       </label>
+      {hasSubject && (
+        <div className={'hint' + (subject.trim() ? '' : ' warn-text')}>
+          {subject.trim() ? (
+            <>
+              <b>{'{предмет}'}</b> берётся из поля «Предмет на этом шаблоне» над наклейкой: сейчас «{subject.trim()}».
+            </>
+          ) : (
+            <>
+              ⚠ <b>{'{предмет}'}</b> пока пустой — впишите предмет в поле над наклейкой.
+            </>
+          )}
+        </div>
+      )}
       <div className="chips-label muted tiny">Вставить данные ученика (подставятся сами):</div>
       <div className="chips">
         {PLACEHOLDERS.map((p) => (
@@ -366,7 +490,7 @@ function LineSettings({ line, sample, patch, nudge, remove, fontForAll }: {
           <div className="seg">
             {(['left', 'center', 'right'] as Align[]).map((a) => (
               <button key={a} className={line.align === a ? 'on' : ''} onClick={() => patch({ align: a })} title={{ left: 'По левому краю', center: 'По центру', right: 'По правому краю' }[a]}>
-                <AlignIcon a={a} />
+                <AlignGlyph a={a} />
               </button>
             ))}
           </div>
@@ -410,17 +534,6 @@ function LineSettings({ line, sample, patch, nudge, remove, fontForAll }: {
   )
 }
 
-function AlignIcon({ a }: { a: Align }) {
-  const rows = a === 'left' ? [[2, 14], [2, 10], [2, 12]] : a === 'right' ? [[2, 14], [6, 10], [4, 12]] : [[2, 14], [4, 10], [3, 12]]
-  return (
-    <svg width="16" height="14" viewBox="0 0 16 14" aria-hidden>
-      {rows.map(([x, w], i) => (
-        <rect key={i} x={x} y={2 + i * 4} width={w} height={2} rx={1} fill="currentColor" />
-      ))}
-    </svg>
-  )
-}
-
 function GridEditor({ sheet, onChange }: { sheet: Sheet; onChange: (g: Grid) => void }) {
   const g = sheet.grid
   const mmW = (sheet.widthPt / 72) * 25.4
@@ -458,39 +571,6 @@ function GridEditor({ sheet, onChange }: { sheet: Sheet; onChange: (g: Grid) => 
       {slider('Отступ справа', 'right', mmW)}
       {slider('Промежуток между столбцами', 'gapX', mmW, 20)}
       {slider('Промежуток между рядами', 'gapY', mmH, 20)}
-    </div>
-  )
-}
-
-function ApplyDialog({ sheet, close }: { sheet: Sheet; close: () => void }) {
-  const { state, update, toast } = useApp()
-  const others = state.sheets.filter((s) => s.id !== sheet.id)
-  const [ids, setIds] = useState<string[]>([])
-  return (
-    <div className="modal-back" onClick={close}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>Применить настройку к другим шаблонам</h2>
-        <p className="muted">Строки, шрифты и их места с «{sheet.name}» будут скопированы в выбранные шаблоны.</p>
-        <SheetPicker sheets={others} selected={ids} onChange={setIds} />
-        <div className="row end gap-s">
-          <button className="btn ghost" onClick={close}>
-            Отмена
-          </button>
-          <button
-            className="btn primary"
-            disabled={!ids.length}
-            onClick={() => {
-              update((d) => {
-                for (const s of d.sheets) if (ids.includes(s.id)) s.layout = cloneLayout(sheet.layout)
-              })
-              toast(`Настройка применена: ${ids.length} ${plural(ids.length, 'шаблон', 'шаблона', 'шаблонов')}`)
-              close()
-            }}
-          >
-            Применить
-          </button>
-        </div>
-      </div>
     </div>
   )
 }

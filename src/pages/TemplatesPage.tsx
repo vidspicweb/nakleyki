@@ -6,6 +6,7 @@ import { importFile, isImage, isPdf } from '../importer'
 import type { Sheet } from '../types'
 import { plural } from '../util'
 import { markDeleted } from '../cloud/merge'
+import { ensureCommon } from '../layouts'
 import { Thumb } from '../components/Thumb'
 import { FilterBar, TagPopover } from '../components/Tags'
 import { applyTag, filterSheets, tagLabel } from '../tags'
@@ -53,12 +54,13 @@ export function TemplatesPage({ goNext }: { goNext: () => void }) {
         const prefix = list.length > 1 ? `Файл ${n + 1} из ${list.length}. ` : ''
         const { template, sheets } = await importFile(file, {
           tags: uploadTags,
-          baseLayout: state.lastLayout,
+          baseLayout: state.commonLayout ?? state.lastLayout,
           onStep: (m) => setBusy(prefix + m),
         })
         update((d) => {
           d.templates.push(template)
           d.sheets.push(...sheets)
+          ensureCommon(d)
           if (!d.activeSheetId) d.activeSheetId = sheets[0]?.id
         })
         added += sheets.length

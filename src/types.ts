@@ -71,6 +71,7 @@ export interface Sheet {
   widthPt: number
   heightPt: number
   tags?: string[] // метки для поиска: «Математика», «Для девочек»…
+  ownLayout?: boolean // true — своя раскладка строк; иначе используется общая (AppState.commonLayout)
   addedAt?: number
 }
 
@@ -87,7 +88,8 @@ export interface AppState {
   fonts: UploadedFont[]
   activeClassId?: string
   activeSheetId?: string
-  lastLayout?: Layout
+  lastLayout?: Layout // устарело: раньше раскладка копировалась из последней настроенной
+  commonLayout?: Layout // общая раскладка строк для всех шаблонов
   customTags?: string[] // метки, которые пользователь придумал сам
   updatedAt?: number // когда данные менялись в последний раз (для синхронизации)
   deleted?: Record<string, number> // что удалено: id → когда (чтобы удаление дошло до других компьютеров)

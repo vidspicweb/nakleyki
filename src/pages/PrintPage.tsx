@@ -5,6 +5,7 @@ import { buildPdf, planPages } from '../export'
 import { SheetPreview } from '../components/SheetPreview'
 import { SheetPicker } from '../components/SheetPicker'
 import { plural } from '../util'
+import { resolveSheet } from '../layouts'
 
 export function PrintPage({ goTab }: { goTab: (t: Tab) => void }) {
   const { state, update, toast } = useApp()
@@ -14,7 +15,7 @@ export function PrintPage({ goTab }: { goTab: (t: Tab) => void }) {
   const classIds = state.print.classIds.filter((id) => state.classes.some((c) => c.id === id))
   const sheetIds = state.print.sheetIds.filter((id) => state.sheets.some((s) => s.id === id))
   const classes = state.classes.filter((c) => classIds.includes(c.id))
-  const sheets = state.sheets.filter((s) => sheetIds.includes(s.id))
+  const sheets = useMemo(() => state.sheets.filter((s) => sheetIds.includes(s.id)).map((s) => resolveSheet(state, s)), [state, sheetIds.join()])
   const copies = state.print.copies
 
   // при первом заходе — выбрать что-нибудь, чтобы не было пусто

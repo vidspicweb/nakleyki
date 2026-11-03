@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import type { AppState } from './types'
 import { loadState, saveState } from './storage'
 import { registerUploadedFont } from './fonts'
+import { migrateLayouts } from './layouts'
 import { CloudSync } from './cloud/sync'
 import type { SyncStatus } from './cloud/sync'
 import { YANDEX_CLIENT_ID } from './cloud/config'
@@ -71,8 +72,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         token.value,
         () => stateRef.current!,
         (next) => {
-          fromCloud.current = next
-          setState(next)
+          const fixed = migrateLayouts(next)
+          fromCloud.current = fixed
+          setState(fixed)
           for (const f of next.fonts) registerUploadedFont(f).catch(() => undefined)
         },
         (st) => {
@@ -98,7 +100,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const back = takeTokenFromUrl()
-    loadState().then(async (s) => {
+    loadState().then(async (loaded) => {
+      const s = migrateLayouts(loaded)
       for (const f of s.fonts) await registerUploadedFont(f).catch(() => undefined)
       stateRef.current = s
       setState(s)
@@ -132,7 +135,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     })
   }, [])
 
-  const replace = useCallback((s: AppState) => setState({ ...s, updatedAt: Date.now() }), [])
+  const replace = useCallback((s: AppState) => setState({ ...migrateLayouts(s), updatedAt: Date.now() }), [])
 
   const cloud: CloudCtx = {
     configured: !!YANDEX_CLIENT_ID,

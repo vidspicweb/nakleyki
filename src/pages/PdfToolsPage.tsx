@@ -10,6 +10,7 @@ import type { CutScope, EditorCommon, EditorMode } from '../pdftools/dialogs'
 import { FULL, compose, rebase, toBase } from '../pdftools/geom'
 import type { FRect } from '../pdftools/geom'
 import { uid } from '../util'
+import { ensureCommon } from '../layouts'
 
 type SplitMode = 'each' | 'every' | 'ranges' | 'selected'
 
@@ -213,10 +214,11 @@ export function PdfToolsPage({ goLibrary }: { goLibrary: () => void }) {
     try {
       const bytes = await buildPdf(list, sources)
       const file = new File([bytes as BlobPart], fileName + '.pdf', { type: 'application/pdf' })
-      const { template, sheets } = await importFile(file, { tags: [], baseLayout: state.lastLayout })
+      const { template, sheets } = await importFile(file, { tags: [], baseLayout: state.commonLayout ?? state.lastLayout })
       update((d) => {
         d.templates.push(template)
         d.sheets.push(...sheets)
+        ensureCommon(d)
       })
       toast(`В библиотеку добавлено ${sheets.length} ${plural(sheets.length, 'шаблон', 'шаблона', 'шаблонов')}`)
     } catch (e) {
